@@ -10,6 +10,7 @@ import platform
 import subprocess
 import psutil
 import wmi
+import pythoncom
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -123,20 +124,47 @@ class ClientConfigManager:
 class SystemInfoCollector:
     def __init__(self):
         self.wmi_conn = None
-        try:
-            self.wmi_conn = wmi.WMI()
-        except Exception as e:
-            logger.warning(f"WMI not available: {e}")
+
+    def _get_wmi_conn(self):
+        """Get or create WMI connection with proper COM initialization"""
+        if self.wmi_conn is None:
+            try:
+                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+                self.wmi_conn = wmi.WMI()
+            except Exception as e:
+                logger.warning(f"WMI not available: {e}")
+                self.wmi_conn = False  # Use False to indicate failed initialization
+        return self.wmi_conn if self.wmi_conn is not False else None
 
     def collect(self):
+        # Initialize COM for this thread
+        try:
+            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+        except:
+            pass
+            
+        cpu_info = self._get_detailed_cpu_info()
+        ram_info = self._get_detailed_ram_info()
+        gpu_info = self._get_gpu_info()
+        monitor_info = self._get_monitor_info()
+        motherboard_info = self._get_motherboard_info()
+        
+        devices = self._get_devices()
+        # Add detailed hardware as devices
+        devices.extend(cpu_info)
+        devices.extend(ram_info)
+        devices.extend(gpu_info)
+        devices.extend(monitor_info)
+        devices.extend(motherboard_info)
+        
         data = {
             'hostname': platform.node(),
             'mac_address': self._get_mac_address(),
             'os_name': platform.system(),
             'os_version': platform.version(),
-            'cpu_info': self._get_cpu_info(),
+            'cpu_info': cpu_info[0]['name'] if cpu_info else self._get_cpu_info(),
             'ram_total_gb': round(psutil.virtual_memory().total / (1024**3), 2),
-            'devices': self._get_devices()
+            'devices': devices
         }
         return data
 
@@ -149,18 +177,184 @@ class SystemInfoCollector:
 
     def _get_cpu_info(self):
         try:
-            if self.wmi_conn:
-                for cpu in self.wmi_conn.Win32_Processor():
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for cpu in wmi_conn.Win32_Processor():
                     return cpu.Name.strip()
         except:
             pass
         return platform.processor() or "Unknown"
 
+    def _get_detailed_cpu_info(self):
+        """Get detailed CPU info as device entries"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for cpu in wmi_conn.Win32_Processor():
+                    name = cpu.Name.strip() if cpu.Name else "Unknown Processor"
+                    cores = cpu.NumberOfCores if cpu.NumberOfCores else 0
+                    threads = cpu.NumberOfLogicalProcessors if cpu.NumberOfLogicalProcessors else 0
+                    max_clock = cpu.MaxClockSpeed if cpu.MaxClockSpeed else 0
+                    current_clock = cpu.CurrentClockSpeed if cpu.CurrentClockSpeed else 0
+                    manufacturer = cpu.Manufacturer.strip() if cpu.Manufacturer else "Unknown"
+                    
+                    devices.append({
+                        'class': 'Processor',
+                        'name': f'{name} ({cores}C/{threads}T, {max_clock} MHz)',
+                        'device_id': cpu.DeviceID.strip() if cpu.DeviceID else 'CPU0',
+                        'manufacturer': manufacturer,
+                        'driver_version': f'Cores: {cores}, Threads: {threads}, Max Clock: {max_clock} MHz, Current: {current_clock} MHz',
+                        'status': cpu.Status.strip() if cpu.Status else 'OK'
+                    })
+        except Exception as e:
+            logger.warning(f"Detailed CPU collection failed: {e}")
+        return devices
+
+    def _get_detailed_ram_info(self):
+        """Get detailed RAM stick info"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for mem in wmi_conn.Win32_PhysicalMemory():
+                    capacity_gb = round(int(mem.Capacity) / (1024**3), 2) if mem.Capacity else 0
+                    speed = mem.Speed if mem.Speed else 0
+                    manufacturer = mem.Manufacturer.strip() if mem.Manufacturer else "Unknown"
+                    part_number = mem.PartNumber.strip() if mem.PartNumber else "Unknown"
+                    serial = mem.SerialNumber.strip() if mem.SerialNumber else "Unknown"
+                    device_locator = mem.DeviceLocator.strip() if mem.DeviceLocator else "Unknown"
+                    bank_label = mem.BankLabel.strip() if mem.BankLabel else "Unknown"
+                    
+                    # Memory type mapping
+                    mem_type_map = {
+                        20: 'DDR',
+                        21: 'DDR2',
+                        22: 'DDR2 FB-DIMM',
+                        23: 'DDR2 FB-DIMM',
+                        24: 'DDR3',
+                        25: 'FBD2',
+                        26: 'DDR4',
+                        27: 'DDR5'
+                    }
+                    mem_type = mem_type_map.get(mem.MemoryType, '') if mem.MemoryType else ''
+                    # Infer from speed if type is unknown
+                    if not mem_type or mem_type.startswith('Type'):
+                        if speed >= 4800:
+                            mem_type = 'DDR5'
+                        elif speed >= 2133:
+                            mem_type = 'DDR4'
+                        elif speed >= 800:
+                            mem_type = 'DDR3'
+                        else:
+                            mem_type = 'DDR'
+                    # Also check part number for DDR info
+                    if 'DDR5' in part_number.upper():
+                        mem_type = 'DDR5'
+                    elif 'DDR4' in part_number.upper():
+                        mem_type = 'DDR4'
+                    elif 'DDR3' in part_number.upper():
+                        mem_type = 'DDR3'
+                    elif 'DDR2' in part_number.upper():
+                        mem_type = 'DDR2'
+                    
+                    devices.append({
+                        'class': 'Memory',
+                        'name': f'{device_locator} / {bank_label}: {capacity_gb} GB {mem_type} {speed} MHz',
+                        'device_id': mem.Tag.strip() if mem.Tag else 'RAM',
+                        'manufacturer': manufacturer,
+                        'driver_version': f'Part: {part_number}, Serial: {serial}, Speed: {speed} MHz, Type: {mem_type}',
+                        'status': 'OK'
+                    })
+        except Exception as e:
+            logger.warning(f"Detailed RAM collection failed: {e}")
+        return devices
+
+    def _get_gpu_info(self):
+        """Get video card info"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for gpu in wmi_conn.Win32_VideoController():
+                    name = gpu.Name.strip() if gpu.Name else "Unknown GPU"
+                    vram = round(int(gpu.AdapterRAM) / (1024**3), 2) if gpu.AdapterRAM else 0
+                    driver_version = gpu.DriverVersion.strip() if gpu.DriverVersion else "Unknown"
+                    driver_date = gpu.DriverDate.strip() if gpu.DriverDate else "Unknown"
+                    manufacturer = gpu.AdapterCompatibility.strip() if gpu.AdapterCompatibility else "Unknown"
+                    video_mode = gpu.VideoModeDescription.strip() if gpu.VideoModeDescription else "Unknown"
+                    pnp_device_id = gpu.PNPDeviceID.strip() if gpu.PNPDeviceID else "Unknown"
+                    
+                    devices.append({
+                        'class': 'DisplayAdapter',
+                        'name': f'{name} ({vram} GB VRAM)',
+                        'device_id': pnp_device_id,
+                        'manufacturer': manufacturer,
+                        'driver_version': f'Driver: {driver_version} ({driver_date}), Mode: {video_mode}',
+                        'status': gpu.Status.strip() if gpu.Status else 'OK'
+                    })
+        except Exception as e:
+            logger.warning(f"GPU collection failed: {e}")
+        return devices
+
+    def _get_monitor_info(self):
+        """Get monitor info"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for monitor in wmi_conn.Win32_DesktopMonitor():
+                    name = monitor.Name.strip() if monitor.Name else "Unknown Monitor"
+                    manufacturer = monitor.MonitorManufacturer.strip() if monitor.MonitorManufacturer else "Unknown"
+                    monitor_type = monitor.MonitorType.strip() if monitor.MonitorType else "Unknown"
+                    screen_width = monitor.ScreenWidth if monitor.ScreenWidth else 0
+                    screen_height = monitor.ScreenHeight if monitor.ScreenHeight else 0
+                    pnp_device_id = monitor.PNPDeviceID.strip() if monitor.PNPDeviceID else "Unknown"
+                    
+                    resolution = f'{screen_width}x{screen_height}' if screen_width and screen_height else 'Unknown'
+                    
+                    devices.append({
+                        'class': 'Monitor',
+                        'name': f'{name} ({resolution})',
+                        'device_id': pnp_device_id,
+                        'manufacturer': manufacturer,
+                        'driver_version': f'Type: {monitor_type}, Resolution: {resolution}',
+                        'status': monitor.Status.strip() if monitor.Status else 'OK'
+                    })
+        except Exception as e:
+            logger.warning(f"Monitor collection failed: {e}")
+        return devices
+
+    def _get_motherboard_info(self):
+        """Get motherboard info"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for mb in wmi_conn.Win32_BaseBoard():
+                    manufacturer = mb.Manufacturer.strip() if mb.Manufacturer else "Unknown"
+                    product = mb.Product.strip() if mb.Product else "Unknown"
+                    version = mb.Version.strip() if mb.Version else "Unknown"
+                    serial = mb.SerialNumber.strip() if mb.SerialNumber else "Unknown"
+                    
+                    devices.append({
+                        'class': 'Motherboard',
+                        'name': f'{manufacturer} {product} (Rev {version})',
+                        'device_id': mb.Tag.strip() if mb.Tag else 'MB0',
+                        'manufacturer': manufacturer,
+                        'driver_version': f'Version: {version}, Serial: {serial}',
+                        'status': 'OK'
+                    })
+        except Exception as e:
+            logger.warning(f"Motherboard collection failed: {e}")
+        return devices
+
     def _get_devices(self):
         devices = []
         try:
-            if self.wmi_conn:
-                for device in self.wmi_conn.Win32_PnPEntity():
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for device in wmi_conn.Win32_PnPEntity():
                     if device.DeviceID and device.Name:
                         devices.append({
                             'class': device.ClassGuid or "Unknown",
@@ -176,28 +370,9 @@ class SystemInfoCollector:
         return devices
 
     def _get_devices_fallback(self):
-        """Fallback device collection using basic system info"""
+        """Fallback device collection using basic system info (for non-WMI systems)"""
         devices = []
         try:
-            # Add basic CPU as a device
-            devices.append({
-                'class': 'Processor',
-                'name': self._get_cpu_info(),
-                'device_id': 'CPU0',
-                'manufacturer': 'Unknown',
-                'driver_version': 'N/A',
-                'status': 'OK'
-            })
-            # Add memory info
-            mem = psutil.virtual_memory()
-            devices.append({
-                'class': 'Memory',
-                'name': f'RAM {round(mem.total / (1024**3), 2)} GB',
-                'device_id': 'RAM0',
-                'manufacturer': 'Unknown',
-                'driver_version': 'N/A',
-                'status': 'OK'
-            })
             # Add disk info
             for partition in psutil.disk_partitions():
                 try:

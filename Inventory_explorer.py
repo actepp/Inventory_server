@@ -173,24 +173,16 @@ class InventoryExplorer:
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('ip', 'os', 'cpu', 'ram', 'last_seen', 'status')
+        columns = ('status', 'info')
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='tree headings')
         
         self.tree.heading('#0', text='Компьютер', anchor=tk.W)
-        self.tree.heading('ip', text='IP адрес', anchor=tk.W)
-        self.tree.heading('os', text='ОС', anchor=tk.W)
-        self.tree.heading('cpu', text='CPU', anchor=tk.W)
-        self.tree.heading('ram', text='RAM (GB)', anchor=tk.CENTER)
-        self.tree.heading('last_seen', text='Последний раз', anchor=tk.W)
         self.tree.heading('status', text='Статус', anchor=tk.CENTER)
+        self.tree.heading('info', text='Информация', anchor=tk.W)
 
-        self.tree.column('#0', width=250, minwidth=200)
-        self.tree.column('ip', width=120, minwidth=100)
-        self.tree.column('os', width=150, minwidth=120)
-        self.tree.column('cpu', width=200, minwidth=150)
-        self.tree.column('ram', width=80, minwidth=60, anchor=tk.CENTER)
-        self.tree.column('last_seen', width=150, minwidth=120)
-        self.tree.column('status', width=80, minwidth=60, anchor=tk.CENTER)
+        self.tree.column('#0', width=300, minwidth=250)
+        self.tree.column('status', width=100, minwidth=80, anchor=tk.CENTER)
+        self.tree.column('info', width=500, minwidth=300)
 
         # Scrollbars
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -292,27 +284,53 @@ class InventoryExplorer:
             is_online = comp_id in online_computers
             status_text = "🟢 Онлайн" if is_online else "🔴 Офлайн"
             
-            last_seen = comp.get('last_seen', '')
-            if last_seen:
-                try:
-                    dt = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
-                    last_seen = dt.strftime('%d.%m.%Y %H:%M')
-                except:
-                    pass
-            
-            ram = comp.get('ram_total_gb', 0)
-            if ram:
-                ram = f"{ram:.1f}"
-            
             item_id = self.tree.insert('', 'end', 
                 text=f"  {comp['hostname']}",
-                values=(comp['ip_address'], comp.get('os_name', ''), comp.get('cpu_info', ''), ram, last_seen, status_text),
+                values=(status_text, ''),
                 open=False)
             
+            # Add system info as child nodes
+            self._add_system_info_nodes(item_id, comp)
+            
             # Add placeholder for devices
-            self.tree.insert(item_id, 'end', text='Загрузка...', values=('', '', '', '', '', ''))
+            self.tree.insert(item_id, 'end', text='📁 Устройства (загрузка...)', values=('', ''))
         
         self.status_var.set(f"Найдено ПК: {len(computers)}")
+
+    def _add_system_info_nodes(self, parent_item, comp):
+        """Add system info as child nodes under computer"""
+        # IP Address
+        ip = comp.get('ip_address', 'Unknown')
+        self.tree.insert(parent_item, 'end', text='🌐 IP адрес', values=('', ip))
+        
+        # OS
+        os_name = comp.get('os_name', 'Unknown')
+        os_version = comp.get('os_version', '')
+        os_info = f'{os_name} {os_version}'.strip()
+        self.tree.insert(parent_item, 'end', text='🖥 Операционная система', values=('', os_info))
+        
+        # CPU
+        cpu = comp.get('cpu_info', 'Unknown')
+        self.tree.insert(parent_item, 'end', text='🔧 Процессор', values=('', cpu))
+        
+        # RAM
+        ram = comp.get('ram_total_gb', 0)
+        ram_text = f'{ram:.1f} GB' if ram else 'Unknown'
+        self.tree.insert(parent_item, 'end', text='💾 Оперативная память', values=('', ram_text))
+        
+        # Last seen
+        last_seen = comp.get('last_seen', '')
+        if last_seen:
+            try:
+                dt = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
+                last_seen = dt.strftime('%d.%m.%Y %H:%M')
+            except:
+                pass
+        self.tree.insert(parent_item, 'end', text='🕐 Последний раз', values=('', last_seen or 'Unknown'))
+        
+        # MAC Address
+        mac = comp.get('mac_address', 'Unknown')
+        self.tree.insert(parent_item, 'end', text='🔗 MAC адрес', values=('', mac))
 
     def _on_tree_open(self, event):
         item = self.tree.focus()
@@ -340,9 +358,16 @@ class InventoryExplorer:
             self._populate_devices(computer_item, devices)
         except Exception as e:
             logger.error(f"Failed to load devices: {e}")
-            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=('', '', '', '', '', ''))
+            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=('', ''))
 
     def _populate_devices(self, computer_item, devices):
+        # Remove the placeholder
+        children = self.tree.get_children(computer_item)
+        for child in children:
+            if 'загрузка' in self.tree.item(child, 'text').lower():
+                self.tree.delete(child)
+                break
+        
         # Group by class
         classes = {}
         for dev in devices:
@@ -351,13 +376,41 @@ class InventoryExplorer:
                 classes[cls] = []
             classes[cls].append(dev)
         
+        # Class icons mapping
+        class_icons = {
+            'Processor': '🔧',
+            'Memory': '💾',
+            'DisplayAdapter': '🎮',
+            'Monitor': '🖥',
+            'Motherboard': '📋',
+            'DiskDrive': '💿',
+            'NetworkAdapter': '🌐',
+        }
+        
         for cls, devs in sorted(classes.items()):
-            class_item = self.tree.insert(computer_item, 'end', text=f'📁 {cls}', values=('', '', '', '', '', ''))
+            icon = class_icons.get(cls, '📦')
+            class_item = self.tree.insert(computer_item, 'end', text=f'{icon} {cls}', values=('', ''))
             for dev in devs:
+                name = dev.get('device_name', 'Unknown')
+                manufacturer = dev.get('manufacturer', '')
+                driver_version = dev.get('driver_version', '')
+                status = dev.get('status', '')
+                device_id = dev.get('device_id', '')
+                
+                # Build info string
+                info_parts = []
+                if manufacturer and manufacturer != 'Unknown':
+                    info_parts.append(f'Производитель: {manufacturer}')
+                if driver_version and driver_version != 'Unknown' and driver_version != 'N/A':
+                    info_parts.append(f'Драйвер: {driver_version}')
+                if device_id and device_id != 'Unknown':
+                    info_parts.append(f'ID: {device_id}')
+                
+                info_text = ' | '.join(info_parts) if info_parts else ''
+                
                 self.tree.insert(class_item, 'end', 
-                    text=f'  {dev.get("device_name", "Unknown")}',
-                    values=(dev.get('device_id', ''), dev.get('manufacturer', ''), 
-                           dev.get('driver_version', ''), dev.get('status', ''), '', ''))
+                    text=f'  {name}',
+                    values=(status, info_text))
 
     def _on_select(self, event):
         item = self.tree.focus()
