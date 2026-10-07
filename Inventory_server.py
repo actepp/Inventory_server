@@ -8,6 +8,8 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 import pystray
 from pystray._win32 import Icon as Win32Icon
@@ -50,7 +52,7 @@ def get_base_dir():
 
 CONFIG_FILE = get_base_dir() / "server_config.json"
 DB_FILE = get_base_dir() / "inventory.db"
-DEFAULT_PORT = 5000
+DEFAULT_PORT = 5001
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,6 +163,129 @@ class DatabaseManager:
                 FROM devices WHERE computer_id = ? ORDER BY device_class, device_name
             ''', (computer_id,))
             return cursor.fetchall()
+
+
+class APIRequestHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, db_manager=None, **kwargs):
+        self.db_manager = db_manager
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        
+        if path == '/api/computers':
+            self._handle_get_computers()
+        elif path.startswith('/api/computers/') and path.endswith('/devices'):
+            computer_id = path.split('/')[3]
+            self._handle_get_devices(computer_id)
+        else:
+            self._send_json({'error': 'Not found'}, 404)
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        
+        if path.startswith('/api/computers/'):
+            computer_id = path.split('/')[3]
+            self._handle_delete_computer(computer_id)
+        else:
+            self._send_json({'error': 'Not found'}, 404)
+
+    def _handle_get_computers(self):
+        try:
+            computers = self.db_manager.get_all_computers()
+            result = []
+            for c in computers:
+                result.append({
+                    'id': c[0],
+                    'hostname': c[1],
+                    'ip_address': c[2],
+                    'mac_address': c[3],
+                    'os_name': c[4],
+                    'os_version': c[5],
+                    'cpu_info': c[6],
+                    'ram_total_gb': c[7],
+                    'last_seen': c[8]
+                })
+            self._send_json(result)
+        except Exception as e:
+            logger.error(f"API error getting computers: {e}")
+            self._send_json({'error': str(e)}, 500)
+
+    def _handle_get_devices(self, computer_id):
+        try:
+            devices = self.db_manager.get_devices_for_computer(int(computer_id))
+            result = []
+            for d in devices:
+                result.append({
+                    'device_class': d[0],
+                    'device_name': d[1],
+                    'device_id': d[2],
+                    'manufacturer': d[3],
+                    'driver_version': d[4],
+                    'status': d[5]
+                })
+            self._send_json(result)
+        except Exception as e:
+            logger.error(f"API error getting devices: {e}")
+            self._send_json({'error': str(e)}, 500)
+
+    def _handle_delete_computer(self, computer_id):
+        try:
+            with sqlite3.connect(self.db_manager.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM devices WHERE computer_id = ?', (computer_id,))
+                cursor.execute('DELETE FROM computers WHERE id = ?', (computer_id,))
+                conn.commit()
+            logger.info(f"Deleted computer {computer_id}")
+            self._send_json({'success': True})
+        except Exception as e:
+            logger.error(f"API error deleting computer: {e}")
+            self._send_json({'error': str(e)}, 500)
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        logger.info(f"API: {format % args}")
+
+
+class APIServer:
+    def __init__(self, port: int, db_manager: DatabaseManager):
+        self.port = port
+        self.db_manager = db_manager
+        self.server = None
+        self.thread = None
+        self.running = False
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        handler = lambda *args, **kwargs: APIRequestHandler(*args, db_manager=self.db_manager, **kwargs)
+        self.server = HTTPServer(('0.0.0.0', self.port), handler)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        logger.info(f"API server started on port {self.port}")
+
+    def stop(self):
+        self.running = False
+        if self.server:
+            try:
+                self.server.shutdown()
+            except:
+                pass
+        if self.thread:
+            self.thread.join(timeout=2)
+        logger.info("API server stopped")
+
+    def _run(self):
+        self.server.serve_forever()
 
 
 class ConfigManager:
@@ -367,12 +492,14 @@ class InventoryServer:
         self.config_manager = ConfigManager(CONFIG_FILE)
         self.db_manager = DatabaseManager(DB_FILE)
         self.listener = NetworkListener(self.config_manager.get_port(), self.db_manager)
+        self.api_server = APIServer(self.config_manager.get_port() + 1, self.db_manager)
         self.tray_icon = None
         self.root = tk.Tk()
         self.root.withdraw()
 
     def run(self):
         self.listener.start()
+        self.api_server.start()
         self._create_tray_icon()
         self.root.mainloop()
 
@@ -401,6 +528,7 @@ class InventoryServer:
 
     def _exit_app(self, icon=None, item=None):
         self.listener.stop()
+        self.api_server.stop()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.after(0, self.root.quit)
