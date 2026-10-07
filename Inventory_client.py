@@ -469,6 +469,45 @@ class SystemInfoCollector:
             logger.warning(f"Motherboard collection failed: {e}")
         return devices
 
+    def _get_network_adapters(self):
+        """Get network adapters with link speed"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for na in wmi_conn.Win32_NetworkAdapter():
+                    if na.NetConnectionStatus == 2 and na.Speed:  # Connected and has speed
+                        name = na.Name.strip() if na.Name else "Unknown"
+                        speed = na.Speed
+                        # Speed can be string or int
+                        try:
+                            speed = int(speed)
+                        except (ValueError, TypeError):
+                            speed = 0
+                        
+                        # Format speed
+                        if speed >= 1000000000:
+                            speed_str = f'{speed // 1000000000} Gbps'
+                        elif speed >= 1000000:
+                            speed_str = f'{speed // 1000000} Mbps'
+                        else:
+                            speed_str = f'{speed} bps'
+                        
+                        mac = na.MACAddress.strip() if na.MACAddress else "Unknown"
+                        manufacturer = na.Manufacturer.strip() if na.Manufacturer else "Unknown"
+                        
+                        devices.append({
+                            'class': 'NetworkAdapter',
+                            'name': name,
+                            'device_id': mac,
+                            'manufacturer': manufacturer,
+                            'driver_version': f'Speed: {speed_str}',
+                            'status': 'OK'
+                        })
+        except Exception as e:
+            logger.warning(f"Network adapter collection failed: {e}")
+        return devices
+
     def _get_devices(self):
         devices = []
         try:
@@ -487,6 +526,9 @@ class SystemInfoCollector:
         except Exception as e:
             logger.warning(f"WMI device collection failed, using fallback: {e}")
             devices = self._get_devices_fallback()
+        
+        # Add network adapters with speed info
+        devices.extend(self._get_network_adapters())
         return devices
 
     def _get_devices_fallback(self):
