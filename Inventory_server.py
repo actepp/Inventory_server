@@ -5,16 +5,51 @@ import threading
 import sqlite3
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pystray
+from pystray._win32 import Icon as Win32Icon
+import win32con
 from PIL import Image, ImageDraw
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-CONFIG_FILE = Path(__file__).parent / "server_config.json"
-DB_FILE = Path(__file__).parent / "inventory.db"
+# Custom Icon class with double-click support for Windows
+class DoubleClickIcon(Win32Icon):
+    def __init__(self, *args, on_double_click=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_double_click = on_double_click
+        self._last_click_time = 0
+
+    def _on_notify(self, wparam, lparam):
+        current_time = time.time()
+        
+        if lparam == win32con.WM_LBUTTONUP:
+            # Check for double-click
+            if current_time - self._last_click_time < 0.5:
+                if self._on_double_click:
+                    self._on_double_click(self)
+                self._last_click_time = 0  # Reset to avoid triple-click detection
+            else:
+                self._last_click_time = current_time
+                # Show menu on single click (default behavior)
+                super()._on_notify(wparam, lparam)
+        elif lparam == win32con.WM_RBUTTONUP:
+            # Right click shows menu
+            super()._on_notify(wparam, lparam)
+        else:
+            super()._on_notify(wparam, lparam)
+
+def get_base_dir():
+    """Get the directory where the executable/script is located."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+CONFIG_FILE = get_base_dir() / "server_config.json"
+DB_FILE = get_base_dir() / "inventory.db"
 DEFAULT_PORT = 5000
 
 logging.basicConfig(
@@ -218,7 +253,11 @@ class NetworkListener:
                     break
                 data += chunk
             if data:
-                self._process_data(data.decode('utf-8'), addr[0])
+                response = self._process_data(data.decode('utf-8'), addr[0])
+                try:
+                    client_socket.sendall(response.encode('utf-8'))
+                except Exception as e:
+                    logger.error(f"Failed to send response to {addr[0]}: {e}")
         except Exception as e:
             logger.error(f"Error handling client {addr}: {e}")
         finally:
@@ -227,6 +266,12 @@ class NetworkListener:
     def _process_data(self, json_data: str, ip_address: str):
         try:
             data = json.loads(json_data)
+            required_fields = ['hostname', 'devices']
+            for field in required_fields:
+                if field not in data:
+                    logger.warning(f"Missing field '{field}' from {ip_address}")
+                    return "ERROR_FORMAT"
+            
             computer_data = {
                 'hostname': data.get('hostname', 'Unknown'),
                 'ip_address': ip_address,
@@ -241,10 +286,13 @@ class NetworkListener:
             if devices:
                 self.db_manager.save_devices(computer_id, devices)
             logger.info(f"Received inventory from {computer_data['hostname']} ({ip_address})")
+            return "OK"
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON from {ip_address}: {e}")
+            return "ERROR_FORMAT"
         except Exception as e:
             logger.error(f"Error processing data from {ip_address}: {e}")
+            return "ERROR_FORMAT"
 
 
 class SettingsWindow:
@@ -333,11 +381,12 @@ class InventoryServer:
             pystray.MenuItem("Настройки", self._show_settings),
             pystray.MenuItem("Выход", self._exit_app)
         )
-        self.tray_icon = pystray.Icon(
+        self.tray_icon = DoubleClickIcon(
             "InventoryServer",
             create_tray_icon(),
             "Inventory Server",
-            menu
+            menu,
+            on_double_click=lambda icon: self.root.after(0, self._show_settings)
         )
         self.tray_icon.run_detached()
 
