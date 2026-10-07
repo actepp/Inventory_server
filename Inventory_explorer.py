@@ -133,6 +133,12 @@ class APIClient:
     def delete_computer(self, computer_id):
         return self._make_request('DELETE', f'/api/computers/{computer_id}')
 
+    def poll_computer(self, computer_id):
+        return self._make_request('POST', f'/api/computers/{computer_id}/poll')
+
+    def poll_all_computers(self):
+        return self._make_request('POST', '/api/computers/poll-all')
+
 
 class InventoryExplorer:
     def __init__(self):
@@ -170,6 +176,7 @@ class InventoryExplorer:
         toolbar.pack(fill=tk.X, pady=(0, 10))
 
         ttk.Button(toolbar, text="🔄 Обновить", command=self._refresh_data).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(toolbar, text="📡 Опросить все", command=self._poll_all).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="🗑 Удалить ПК", command=self._delete_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
@@ -217,6 +224,7 @@ class InventoryExplorer:
 
         # Context menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Опросить", command=self._poll_selected)
         self.context_menu.add_command(label="Удалить", command=self._delete_selected)
         self.context_menu.add_command(label="Обновить", command=self._refresh_data)
         self.tree.bind("<Button-3>", self._show_context_menu)
@@ -481,6 +489,34 @@ class InventoryExplorer:
         except Exception as e:
             logger.error(f"Failed to delete computer: {e}")
             self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка удаления: {err}"))
+
+    def _poll_selected(self):
+        if not self.selected_computer_id:
+            messagebox.showwarning("Внимание", "Выберите компьютер для опроса")
+            return
+        
+        self.status_var.set("Отправка команды опроса...")
+        threading.Thread(target=self._do_poll, args=(self.selected_computer_id,), daemon=True).start()
+
+    def _do_poll(self, computer_id):
+        try:
+            result = self.api_client.poll_computer(computer_id)
+            self.root.after(0, lambda: self.status_var.set(f"Команда опроса отправлена: {result.get('message', 'OK')}"))
+        except Exception as e:
+            logger.error(f"Failed to poll computer: {e}")
+            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка опроса: {err}"))
+
+    def _poll_all(self):
+        self.status_var.set("Отправка команды опроса всем...")
+        threading.Thread(target=self._do_poll_all, daemon=True).start()
+
+    def _do_poll_all(self):
+        try:
+            result = self.api_client.poll_all_computers()
+            self.root.after(0, lambda: self.status_var.set(f"Команда опроса всем отправлена: {result.get('message', 'OK')}"))
+        except Exception as e:
+            logger.error(f"Failed to poll all: {e}")
+            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка опроса всех: {err}"))
 
     def _show_settings(self):
         SettingsWindow(self.root, self.config, self._on_config_change)

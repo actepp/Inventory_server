@@ -622,15 +622,29 @@ class ClientAgent:
             response = sock.recv(1024).decode('utf-8')
             sock.close()
             
-            if response == "OK":
+            # Parse JSON response
+            try:
+                resp_data = json.loads(response)
+                status = resp_data.get('status', 'UNKNOWN')
+                commands = resp_data.get('commands', [])
+            except json.JSONDecodeError:
+                # Backward compatibility with old string responses
+                status = response
+                commands = []
+            
+            if status == "OK":
                 self._set_status("idle", "")
                 logger.info("Inventory sent successfully")
-            elif response == "ERROR_FORMAT":
+                # Handle POLL_NOW command - immediately send again
+                if "POLL_NOW" in commands:
+                    logger.info("POLL_NOW command received, sending inventory again")
+                    self._send_inventory()  # Recursive call for immediate re-send
+            elif status == "ERROR_FORMAT":
                 self._set_status("error", "Сервер: неверный формат данных")
                 logger.warning("Server returned format error")
             else:
-                self._set_status("error", f"Сервер: неизвестный ответ: {response}")
-                logger.warning(f"Unknown server response: {response}")
+                self._set_status("error", f"Сервер: неизвестный ответ: {status}")
+                logger.warning(f"Unknown server response: {status}")
                 
         except socket.timeout:
             self._set_status("error", "Таймаут: сервер не ответил за 15 секунд")

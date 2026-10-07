@@ -82,7 +82,8 @@ class DatabaseManager:
                     ram_total_gb REAL,
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_heartbeat TIMESTAMP
+                    last_heartbeat TIMESTAMP,
+                    poll_requested INTEGER DEFAULT 0
                 )
             ''')
             cursor.execute('''
@@ -107,6 +108,11 @@ class DatabaseManager:
             # Add last_heartbeat column if not exists (for existing databases)
             try:
                 cursor.execute('ALTER TABLE computers ADD COLUMN last_heartbeat TIMESTAMP')
+            except sqlite3.OperationalError:
+                pass
+            # Add poll_requested column if not exists
+            try:
+                cursor.execute('ALTER TABLE computers ADD COLUMN poll_requested INTEGER DEFAULT 0')
             except sqlite3.OperationalError:
                 pass
             conn.commit()
@@ -200,10 +206,39 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, hostname, ip_address, mac_address, os_name, os_version,
-                cpu_info, ram_total_gb, last_seen, last_heartbeat
+                cpu_info, ram_total_gb, last_seen, last_heartbeat, poll_requested
                 FROM computers ORDER BY hostname
             ''')
             return cursor.fetchall()
+
+    def get_poll_requested(self, ip_address: str) -> bool:
+        """Check if poll was requested for this IP"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT poll_requested FROM computers WHERE ip_address = ?', (ip_address,))
+            row = cursor.fetchone()
+            return row and row[0] == 1
+
+    def clear_poll_requested(self, ip_address: str):
+        """Clear poll request flag"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE computers SET poll_requested = 0 WHERE ip_address = ?', (ip_address,))
+            conn.commit()
+
+    def set_poll_requested(self, computer_id: int):
+        """Set poll request flag for a computer"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE computers SET poll_requested = 1 WHERE id = ?', (computer_id,))
+            conn.commit()
+
+    def set_poll_requested_all(self):
+        """Set poll request flag for all computers"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE computers SET poll_requested = 1')
+            conn.commit()
 
 
 class APIRequestHandler(BaseHTTPRequestHandler):
@@ -234,6 +269,34 @@ class APIRequestHandler(BaseHTTPRequestHandler):
             self._handle_delete_computer(computer_id)
         else:
             self._send_json({'error': 'Not found'}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        
+        if path.startswith('/api/computers/') and path.endswith('/poll'):
+            computer_id = path.split('/')[3]
+            self._handle_poll_computer(computer_id)
+        elif path == '/api/computers/poll-all':
+            self._handle_poll_all()
+        else:
+            self._send_json({'error': 'Not found'}, 404)
+
+    def _handle_poll_computer(self, computer_id):
+        try:
+            self.db_manager.set_poll_requested(int(computer_id))
+            self._send_json({'success': True, 'message': 'Poll requested'})
+        except Exception as e:
+            logger.error(f"API error requesting poll: {e}")
+            self._send_json({'error': str(e)}, 500)
+
+    def _handle_poll_all(self):
+        try:
+            self.db_manager.set_poll_requested_all()
+            self._send_json({'success': True, 'message': 'Poll requested for all computers'})
+        except Exception as e:
+            logger.error(f"API error requesting poll all: {e}")
+            self._send_json({'error': str(e)}, 500)
 
     def _handle_get_computers(self):
         try:
@@ -487,7 +550,7 @@ class NetworkListener:
             for field in required_fields:
                 if field not in data:
                     logger.warning(f"Missing field '{field}' from {ip_address}")
-                    return "ERROR_FORMAT"
+                    return json.dumps({"status": "ERROR_FORMAT"})
             
             computer_data = {
                 'hostname': data.get('hostname', 'Unknown'),
@@ -505,13 +568,20 @@ class NetworkListener:
             if devices:
                 self.db_manager.save_devices(computer_id, devices)
             logger.info(f"Received inventory from {computer_data['hostname']} ({ip_address})")
-            return "OK"
+            
+            # Check if poll was requested
+            commands = []
+            if self.db_manager.get_poll_requested(ip_address):
+                commands.append("POLL_NOW")
+                self.db_manager.clear_poll_requested(ip_address)
+            
+            return json.dumps({"status": "OK", "commands": commands})
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON from {ip_address}: {e}")
-            return "ERROR_FORMAT"
+            return json.dumps({"status": "ERROR_FORMAT"})
         except Exception as e:
             logger.error(f"Error processing data from {ip_address}: {e}")
-            return "ERROR_FORMAT"
+            return json.dumps({"status": "ERROR_FORMAT"})
 
 
 class SettingsWindow:
