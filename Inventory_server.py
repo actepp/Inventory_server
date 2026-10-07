@@ -186,7 +186,7 @@ class DatabaseManager:
             ''', (datetime.now().isoformat(), ip_address))
             conn.commit()
 
-    def get_online_computers(self, timeout_seconds: int = 120):
+    def get_online_computers(self, timeout_seconds: int = 30):
         """Get computers that sent heartbeat within timeout"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()

@@ -180,10 +180,6 @@ class InventoryExplorer:
         ttk.Button(toolbar, text="🗑 Удалить ПК", command=self._delete_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
-        # Online status
-        self.online_var = tk.StringVar(value="Онлайн: 0 / 0")
-        ttk.Label(toolbar, textvariable=self.online_var, font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT, padx=20)
-
         # Server agent status
         self.server_status_var = tk.StringVar(value="серверный агент оффлайн")
         self.server_status_label = ttk.Label(toolbar, textvariable=self.server_status_var, font=('Segoe UI', 9, 'bold'), foreground='red')
@@ -196,15 +192,13 @@ class InventoryExplorer:
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('status', 'info')
+        columns = ('info',)
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='tree headings')
         
         self.tree.heading('#0', text='Компьютер', anchor=tk.W)
-        self.tree.heading('status', text='Статус', anchor=tk.CENTER)
         self.tree.heading('info', text='Информация', anchor=tk.W)
 
         self.tree.column('#0', width=300, minwidth=250, stretch=False)
-        self.tree.column('status', width=100, minwidth=80, anchor=tk.CENTER, stretch=False)
         self.tree.column('info', width=500, minwidth=300, stretch=True)
 
         # Scrollbars
@@ -260,8 +254,7 @@ class InventoryExplorer:
     def _fetch_computers(self):
         try:
             computers = self.api_client.get_computers()
-            online_data = self.api_client.get_online()
-            self.root.after(0, lambda c=computers, o=online_data: self._update_tree(c, o))
+            self.root.after(0, lambda c=computers: self._update_tree(c))
             self.root.after(0, self._set_server_online)
         except Exception as e:
             logger.error(f"Failed to fetch computers: {e}")
@@ -283,14 +276,6 @@ class InventoryExplorer:
         self.tree.delete(*self.tree.get_children())
         self.computers_data = {}
         
-        online_computers = set()
-        if online_data and 'computers' in online_data:
-            online_computers = {c['id'] for c in online_data['computers']}
-        
-        online_count = len(online_computers)
-        total_count = len(computers)
-        self.online_var.set(f"Онлайн: {online_count} / {total_count}")
-
         # Track item_ids of computers that were expanded
         expanded_items = []
         
@@ -298,19 +283,16 @@ class InventoryExplorer:
             comp_id = comp['id']
             self.computers_data[comp_id] = comp
             
-            is_online = comp_id in online_computers
-            status_text = "🟢 Онлайн" if is_online else "🔴 Офлайн"
-            
             item_id = self.tree.insert('', 'end', 
                 text=f"  {comp['hostname']}",
-                values=(status_text, ''),
+                values=(''),
                 open=False)
             
             # Add system info as child nodes
             self._add_system_info_nodes(item_id, comp)
             
             # Add placeholder for devices
-            self.tree.insert(item_id, 'end', text='Загрузка...', values=('', ''))
+            self.tree.insert(item_id, 'end', text='Загрузка...', values=(''))
             
             # Restore expanded state for this computer
             if comp['hostname'] in expanded_hostnames:
@@ -346,12 +328,12 @@ class InventoryExplorer:
         
         # CPU
         cpu = comp.get('cpu_info', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🔧 Процессор', values=('', cpu))
+        self.tree.insert(parent_item, 'end', text='🔧 Процессор', values=(cpu,))
         
         # RAM
         ram = comp.get('ram_total_gb', 0)
         ram_text = f'{ram:.1f} GB' if ram else 'Unknown'
-        self.tree.insert(parent_item, 'end', text='💾 Оперативная память', values=('', ram_text))
+        self.tree.insert(parent_item, 'end', text='💾 Оперативная память', values=(ram_text,))
         
         # Last seen
         last_seen = comp.get('last_seen', '')
@@ -361,11 +343,11 @@ class InventoryExplorer:
                 last_seen = dt.strftime('%d.%m.%Y %H:%M')
             except:
                 pass
-        self.tree.insert(parent_item, 'end', text='🕐 Последний раз', values=('', last_seen or 'Unknown'))
+        self.tree.insert(parent_item, 'end', text='🕐 Последний раз', values=(last_seen or 'Unknown',))
         
         # MAC Address
         mac = comp.get('mac_address', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🔗 MAC адрес', values=('', mac))
+        self.tree.insert(parent_item, 'end', text='🔗 MAC адрес', values=(mac,))
 
     def _on_tree_open(self, event):
         item = self.tree.focus()
@@ -398,7 +380,7 @@ class InventoryExplorer:
             self._populate_devices(computer_item, devices)
         except Exception as e:
             logger.error(f"Failed to load devices: {e}")
-            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=('', ''))
+            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=(''))
 
     def _populate_devices(self, computer_item, devices):
         # Remove the placeholder
@@ -429,7 +411,7 @@ class InventoryExplorer:
         
         for cls, devs in sorted(classes.items()):
             icon = class_icons.get(cls, '📦')
-            class_item = self.tree.insert(computer_item, 'end', text=f'{icon} {cls}', values=('', ''))
+            class_item = self.tree.insert(computer_item, 'end', text=f'{icon} {cls}', values=(''))
             for dev in devs:
                 name = dev.get('device_name', 'Unknown')
                 manufacturer = dev.get('manufacturer', '')
@@ -450,7 +432,7 @@ class InventoryExplorer:
                 
                 self.tree.insert(class_item, 'end', 
                     text=f'  {name}',
-                    values=(status, info_text))
+                    values=(info_text,))
 
     def _on_select(self, event):
         item = self.tree.focus()
