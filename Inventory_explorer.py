@@ -41,6 +41,7 @@ CONFIG_FILE = get_base_dir() / "explorer_config.json"
 DEFAULT_SERVER_IP = "127.0.0.1"
 DEFAULT_SERVER_PORT = 5001
 DEFAULT_API_PORT = 5002
+EXPLORER_VERSION = "1.0.0"
 
 
 class ExplorerConfig:
@@ -175,8 +176,7 @@ class InventoryExplorer:
         toolbar = ttk.Frame(main_frame)
         toolbar.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Button(toolbar, text="🔄 Обновить", command=self._refresh_data).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(toolbar, text="📡 Опросить все", command=self._poll_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text="📡 Опросить все", command=self._poll_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(toolbar, text="🗑 Удалить ПК", command=self._delete_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
@@ -220,7 +220,6 @@ class InventoryExplorer:
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="Опросить", command=self._poll_selected)
         self.context_menu.add_command(label="Удалить", command=self._delete_selected)
-        self.context_menu.add_command(label="Обновить", command=self._refresh_data)
         self.tree.bind("<Button-3>", self._show_context_menu)
 
     def _create_menu(self):
@@ -254,15 +253,17 @@ class InventoryExplorer:
     def _fetch_computers(self):
         try:
             computers = self.api_client.get_computers()
+            online_data = self.api_client.get_online()
             self.root.after(0, lambda c=computers: self._update_tree(c))
-            self.root.after(0, self._set_server_online)
+            self.root.after(0, lambda o=online_data: self._set_server_online(o))
         except Exception as e:
             logger.error(f"Failed to fetch computers: {e}")
             self.root.after(0, self._set_server_offline)
             self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка: {err}"))
 
-    def _set_server_online(self):
-        self.server_status_var.set("серверный агент онлайн")
+    def _set_server_online(self, online_data=None):
+        server_version = online_data.get('server_version', '?') if online_data else '?'
+        self.server_status_var.set(f"серверный агент онлайн v{server_version}")
         self.server_status_label.configure(foreground='green')
 
     def _set_server_offline(self):
@@ -316,15 +317,19 @@ class InventoryExplorer:
 
     def _add_system_info_nodes(self, parent_item, comp):
         """Add system info as child nodes under computer"""
+        # Client version
+        client_version = comp.get('client_version', '?')
+        self.tree.insert(parent_item, 'end', text='📦 Версия агент-клиента', values=(client_version,))
+        
         # IP Address
         ip = comp.get('ip_address', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🌐 IP адрес', values=('', ip))
+        self.tree.insert(parent_item, 'end', text='🌐 IP адрес', values=(ip,))
         
         # OS
         os_name = comp.get('os_name', 'Unknown')
         os_version = comp.get('os_version', '')
         os_info = get_os_display_name(os_name, os_version)
-        self.tree.insert(parent_item, 'end', text='🖥 Операционная система', values=('', os_info))
+        self.tree.insert(parent_item, 'end', text='🖥 Операционная система', values=(os_info,))
         
         # CPU
         cpu = comp.get('cpu_info', 'Unknown')
@@ -478,12 +483,16 @@ class InventoryExplorer:
             return
         
         self.status_var.set("Отправка команды опроса...")
-        threading.Thread(target=self._do_poll, args=(self.selected_computer_id,), daemon=True).start()
+        threading.Thread(target=self._do_poll_and_refresh, args=(self.selected_computer_id,), daemon=True).start()
 
-    def _do_poll(self, computer_id):
+    def _do_poll_and_refresh(self, computer_id):
         try:
             result = self.api_client.poll_computer(computer_id)
-            self.root.after(0, lambda: self.status_var.set(f"Команда опроса отправлена: {result.get('message', 'OK')}"))
+            self.root.after(0, lambda: self.status_var.set(f"Команда опроса отправлена, ждём ответ..."))
+            # Wait for client to respond and send inventory
+            time.sleep(1.5)
+            # Refresh tree to show new data
+            self.root.after(0, self._refresh_data)
         except Exception as e:
             logger.error(f"Failed to poll computer: {e}")
             self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка опроса: {err}"))

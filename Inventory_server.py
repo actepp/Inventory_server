@@ -54,6 +54,7 @@ CONFIG_FILE = get_base_dir() / "server_config.json"
 DB_FILE = get_base_dir() / "inventory.db"
 DEFAULT_PORT = 5001
 DEFAULT_API_PORT = 5002
+SERVER_VERSION = "1.0.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,7 +84,8 @@ class DatabaseManager:
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_heartbeat TIMESTAMP,
-                    poll_requested INTEGER DEFAULT 0
+                    poll_requested INTEGER DEFAULT 0,
+                    client_version TEXT
                 )
             ''')
             cursor.execute('''
@@ -115,6 +117,11 @@ class DatabaseManager:
                 cursor.execute('ALTER TABLE computers ADD COLUMN poll_requested INTEGER DEFAULT 0')
             except sqlite3.OperationalError:
                 pass
+            # Add client_version column if not exists
+            try:
+                cursor.execute('ALTER TABLE computers ADD COLUMN client_version TEXT')
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
         logger.info("Database initialized")
 
@@ -130,18 +137,18 @@ class DatabaseManager:
                 computer_id = row[0]
                 cursor.execute('''
                     UPDATE computers SET hostname=?, mac_address=?, os_name=?, os_version=?,
-                    cpu_info=?, ram_total_gb=?, last_seen=? WHERE id=?
+                    cpu_info=?, ram_total_gb=?, last_seen=?, client_version=? WHERE id=?
                 ''', (data.get('hostname'), data.get('mac_address'), data.get('os_name'),
                       data.get('os_version'), data.get('cpu_info'), data.get('ram_total_gb'),
-                      now, computer_id))
+                      now, data.get('client_version'), computer_id))
             else:
                 cursor.execute('''
                     INSERT INTO computers (hostname, ip_address, mac_address, os_name, os_version,
-                    cpu_info, ram_total_gb, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cpu_info, ram_total_gb, first_seen, last_seen, client_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data.get('hostname'), data.get('ip_address'), data.get('mac_address'),
                       data.get('os_name'), data.get('os_version'), data.get('cpu_info'),
-                      data.get('ram_total_gb'), now, now))
+                      data.get('ram_total_gb'), now, now, data.get('client_version')))
                 computer_id = cursor.lastrowid
             conn.commit()
             return computer_id
@@ -192,7 +199,7 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, hostname, ip_address, mac_address, os_name, os_version,
-                cpu_info, ram_total_gb, last_seen, last_heartbeat
+                cpu_info, ram_total_gb, last_seen, last_heartbeat, client_version
                 FROM computers 
                 WHERE last_heartbeat IS NOT NULL 
                 AND datetime(last_heartbeat) > datetime('now', ?)
@@ -206,7 +213,7 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, hostname, ip_address, mac_address, os_name, os_version,
-                cpu_info, ram_total_gb, last_seen, last_heartbeat, poll_requested
+                cpu_info, ram_total_gb, last_seen, last_heartbeat, poll_requested, client_version
                 FROM computers ORDER BY hostname
             ''')
             return cursor.fetchall()
@@ -303,12 +310,12 @@ class APIRequestHandler(BaseHTTPRequestHandler):
             computers = self.db_manager.get_computer_status()
             result = []
             for c in computers:
-                # Determine online status (heartbeat within 120 seconds)
+                # Determine online status (heartbeat within 30 seconds)
                 is_online = False
                 if c[9]:  # last_heartbeat
                     try:
                         hb = datetime.fromisoformat(c[9].replace('Z', '+00:00'))
-                        if (datetime.now() - hb).total_seconds() < 120:
+                        if (datetime.now() - hb).total_seconds() < 30:
                             is_online = True
                     except:
                         pass
@@ -324,7 +331,8 @@ class APIRequestHandler(BaseHTTPRequestHandler):
                     'ram_total_gb': c[7],
                     'last_seen': c[8],
                     'last_heartbeat': c[9],
-                    'is_online': is_online
+                    'is_online': is_online,
+                    'client_version': c[11]
                 })
             self._send_json(result)
         except Exception as e:
@@ -333,7 +341,7 @@ class APIRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_get_online(self):
         try:
-            computers = self.db_manager.get_online_computers(120)
+            computers = self.db_manager.get_online_computers(30)
             result = []
             for c in computers:
                 result.append({
@@ -346,11 +354,13 @@ class APIRequestHandler(BaseHTTPRequestHandler):
                     'cpu_info': c[6],
                     'ram_total_gb': c[7],
                     'last_seen': c[8],
-                    'last_heartbeat': c[9]
+                    'last_heartbeat': c[9],
+                    'client_version': c[10]
                 })
             self._send_json({
                 'online_count': len(result),
-                'computers': result
+                'computers': result,
+                'server_version': SERVER_VERSION
             })
         except Exception as e:
             logger.error(f"API error getting online: {e}")
@@ -546,6 +556,15 @@ class NetworkListener:
     def _process_data(self, json_data: str, ip_address: str):
         try:
             data = json.loads(json_data)
+            
+            # Handle lightweight command check
+            if data.get('command_check'):
+                commands = []
+                if self.db_manager.get_poll_requested(ip_address):
+                    commands.append("POLL_NOW")
+                    self.db_manager.clear_poll_requested(ip_address)
+                return json.dumps({"status": "OK", "commands": commands})
+            
             required_fields = ['hostname', 'devices']
             for field in required_fields:
                 if field not in data:
@@ -560,6 +579,7 @@ class NetworkListener:
                 'os_version': data.get('os_version'),
                 'cpu_info': data.get('cpu_info'),
                 'ram_total_gb': data.get('ram_total_gb'),
+                'client_version': data.get('client_version'),
             }
             computer_id = self.db_manager.upsert_computer(computer_data)
             # Update heartbeat

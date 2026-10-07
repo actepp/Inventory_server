@@ -55,9 +55,11 @@ def get_base_dir():
 
 CONFIG_FILE = get_base_dir() / "client_config.json"
 DEFAULT_SERVER_IP = "127.0.0.1"
-DEFAULT_SERVER_PORT = 5000
+DEFAULT_SERVER_PORT = 5001
 DEFAULT_INTERVAL_HOURS = 1
 DEFAULT_INTERVAL_MINUTES = 0
+COMMAND_CHECK_INTERVAL = 30  # seconds
+CLIENT_VERSION = "1.0.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -164,6 +166,7 @@ class SystemInfoCollector:
             'os_version': platform.version(),
             'cpu_info': cpu_info[0]['name'] if cpu_info else self._get_cpu_info(),
             'ram_total_gb': round(psutil.virtual_memory().total / (1024**3), 2),
+            'client_version': CLIENT_VERSION,
             'devices': devices
         }
         return data
@@ -573,6 +576,7 @@ class ClientAgent:
         self.tray_icon = None
         self.running = False
         self.send_thread = None
+        self.cmd_check_thread = None
         self.error_message = ""
         self.last_status = "idle"
         self.root = tk.Tk()
@@ -594,6 +598,12 @@ class ClientAgent:
             return
         self.send_thread = threading.Thread(target=self._sender_loop, daemon=True)
         self.send_thread.start()
+        
+        # Start command check thread
+        if self.cmd_check_thread and self.cmd_check_thread.is_alive():
+            return
+        self.cmd_check_thread = threading.Thread(target=self._command_check_loop, daemon=True)
+        self.cmd_check_thread.start()
 
     def _sender_loop(self):
         while self.running:
@@ -607,6 +617,43 @@ class ClientAgent:
                 if not self.running:
                     break
                 time.sleep(1)
+
+    def _command_check_loop(self):
+        """Lightweight check for server commands (POLL_NOW) every 30 seconds"""
+        while self.running:
+            time.sleep(COMMAND_CHECK_INTERVAL)
+            if not self.running:
+                break
+            self._check_commands()
+
+    def _check_commands(self):
+        """Lightweight check for POLL_NOW command without sending full inventory"""
+        try:
+            # Minimal payload - just hostname to identify
+            data = {'hostname': platform.node(), 'command_check': True}
+            json_data = json.dumps(data)
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10.0)
+            sock.connect((self.config_manager.get_server_ip(), self.config_manager.get_server_port()))
+            sock.sendall(json_data.encode('utf-8'))
+            sock.shutdown(socket.SHUT_WR)
+            
+            response = sock.recv(1024).decode('utf-8')
+            sock.close()
+            
+            try:
+                resp_data = json.loads(response)
+                commands = resp_data.get('commands', [])
+            except json.JSONDecodeError:
+                commands = []
+            
+            if "POLL_NOW" in commands:
+                logger.info("POLL_NOW received via command check, sending full inventory")
+                self._send_inventory()
+                
+        except Exception as e:
+            logger.debug(f"Command check failed: {e}")
 
     def _send_inventory(self):
         try:
