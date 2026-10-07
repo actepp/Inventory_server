@@ -177,6 +177,11 @@ class InventoryExplorer:
         self.online_var = tk.StringVar(value="Онлайн: 0 / 0")
         ttk.Label(toolbar, textvariable=self.online_var, font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT, padx=20)
 
+        # Server agent status
+        self.server_status_var = tk.StringVar(value="серверный агент оффлайн")
+        self.server_status_label = ttk.Label(toolbar, textvariable=self.server_status_var, font=('Segoe UI', 9, 'bold'), foreground='red')
+        self.server_status_label.pack(side=tk.RIGHT, padx=10)
+
         self.status_var = tk.StringVar(value="Готов")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side=tk.RIGHT)
 
@@ -249,9 +254,19 @@ class InventoryExplorer:
             computers = self.api_client.get_computers()
             online_data = self.api_client.get_online()
             self.root.after(0, lambda c=computers, o=online_data: self._update_tree(c, o))
+            self.root.after(0, self._set_server_online)
         except Exception as e:
             logger.error(f"Failed to fetch computers: {e}")
-            self.root.after(0, lambda err=e: self._show_error(f"Ошибка загрузки: {err}"))
+            self.root.after(0, self._set_server_offline)
+            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка: {err}"))
+
+    def _set_server_online(self):
+        self.server_status_var.set("серверный агент онлайн")
+        self.server_status_label.configure(foreground='green')
+
+    def _set_server_offline(self):
+        self.server_status_var.set("серверный агент оффлайн")
+        self.server_status_label.configure(foreground='red')
 
     def _update_tree(self, computers, online_data=None):
         # Save expanded hostnames before rebuilding
@@ -465,7 +480,7 @@ class InventoryExplorer:
             self.root.after(0, lambda: self.status_var.set("Удалено"))
         except Exception as e:
             logger.error(f"Failed to delete computer: {e}")
-            self.root.after(0, lambda err=e: self._show_error(f"Ошибка удаления: {err}"))
+            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка удаления: {err}"))
 
     def _show_settings(self):
         SettingsWindow(self.root, self.config, self._on_config_change)
@@ -473,10 +488,6 @@ class InventoryExplorer:
     def _on_config_change(self):
         self.api_client = APIClient(self.config)
         self._refresh_data()
-
-    def _show_error(self, msg):
-        self.status_var.set("Ошибка")
-        messagebox.showerror("Ошибка", msg)
 
     def _show_about(self):
         messagebox.showinfo("О программе", 
