@@ -191,9 +191,9 @@ class InventoryExplorer:
         self.tree.heading('status', text='Статус', anchor=tk.CENTER)
         self.tree.heading('info', text='Информация', anchor=tk.W)
 
-        self.tree.column('#0', width=300, minwidth=250)
-        self.tree.column('status', width=100, minwidth=80, anchor=tk.CENTER)
-        self.tree.column('info', width=500, minwidth=300)
+        self.tree.column('#0', width=300, minwidth=250, stretch=False)
+        self.tree.column('status', width=100, minwidth=80, anchor=tk.CENTER, stretch=False)
+        self.tree.column('info', width=500, minwidth=300, stretch=True)
 
         # Scrollbars
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
