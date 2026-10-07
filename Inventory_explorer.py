@@ -111,6 +111,9 @@ class APIClient:
     def get_computers(self):
         return self._make_request('GET', '/api/computers')
 
+    def get_online(self):
+        return self._make_request('GET', '/api/online')
+
     def get_devices(self, computer_id):
         return self._make_request('GET', f'/api/computers/{computer_id}/devices')
 
@@ -159,6 +162,10 @@ class InventoryExplorer:
         ttk.Button(toolbar, text="🗑 Удалить ПК", command=self._delete_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
+        # Online status
+        self.online_var = tk.StringVar(value="Онлайн: 0 / 0")
+        ttk.Label(toolbar, textvariable=self.online_var, font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT, padx=20)
+
         self.status_var = tk.StringVar(value="Готов")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side=tk.RIGHT)
 
@@ -166,7 +173,7 @@ class InventoryExplorer:
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('ip', 'os', 'cpu', 'ram', 'last_seen')
+        columns = ('ip', 'os', 'cpu', 'ram', 'last_seen', 'status')
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='tree headings')
         
         self.tree.heading('#0', text='Компьютер', anchor=tk.W)
@@ -175,6 +182,7 @@ class InventoryExplorer:
         self.tree.heading('cpu', text='CPU', anchor=tk.W)
         self.tree.heading('ram', text='RAM (GB)', anchor=tk.CENTER)
         self.tree.heading('last_seen', text='Последний раз', anchor=tk.W)
+        self.tree.heading('status', text='Статус', anchor=tk.CENTER)
 
         self.tree.column('#0', width=250, minwidth=200)
         self.tree.column('ip', width=120, minwidth=100)
@@ -182,6 +190,7 @@ class InventoryExplorer:
         self.tree.column('cpu', width=200, minwidth=150)
         self.tree.column('ram', width=80, minwidth=60, anchor=tk.CENTER)
         self.tree.column('last_seen', width=150, minwidth=120)
+        self.tree.column('status', width=80, minwidth=60, anchor=tk.CENTER)
 
         # Scrollbars
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -258,18 +267,30 @@ class InventoryExplorer:
     def _fetch_computers(self):
         try:
             computers = self.api_client.get_computers()
-            self.root.after(0, lambda c=computers: self._update_tree(c))
+            online_data = self.api_client.get_online()
+            self.root.after(0, lambda c=computers, o=online_data: self._update_tree(c, o))
         except Exception as e:
             logger.error(f"Failed to fetch computers: {e}")
             self.root.after(0, lambda err=e: self._show_error(f"Ошибка загрузки: {err}"))
 
-    def _update_tree(self, computers):
+    def _update_tree(self, computers, online_data=None):
         self.tree.delete(*self.tree.get_children())
         self.computers_data = {}
         
+        online_computers = set()
+        if online_data and 'computers' in online_data:
+            online_computers = {c['id'] for c in online_data['computers']}
+        
+        online_count = len(online_computers)
+        total_count = len(computers)
+        self.online_var.set(f"Онлайн: {online_count} / {total_count}")
+
         for comp in computers:
             comp_id = comp['id']
             self.computers_data[comp_id] = comp
+            
+            is_online = comp_id in online_computers
+            status_text = "🟢 Онлайн" if is_online else "🔴 Офлайн"
             
             last_seen = comp.get('last_seen', '')
             if last_seen:
@@ -285,11 +306,11 @@ class InventoryExplorer:
             
             item_id = self.tree.insert('', 'end', 
                 text=f"  {comp['hostname']}",
-                values=(comp['ip_address'], comp.get('os_name', ''), comp.get('cpu_info', ''), ram, last_seen),
+                values=(comp['ip_address'], comp.get('os_name', ''), comp.get('cpu_info', ''), ram, last_seen, status_text),
                 open=False)
             
             # Add placeholder for devices
-            self.tree.insert(item_id, 'end', text='Загрузка...', values=('', '', '', '', ''))
+            self.tree.insert(item_id, 'end', text='Загрузка...', values=('', '', '', '', '', ''))
         
         self.status_var.set(f"Найдено ПК: {len(computers)}")
 
@@ -319,7 +340,7 @@ class InventoryExplorer:
             self._populate_devices(computer_item, devices)
         except Exception as e:
             logger.error(f"Failed to load devices: {e}")
-            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=('', '', '', '', ''))
+            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=('', '', '', '', '', ''))
 
     def _populate_devices(self, computer_item, devices):
         # Group by class
@@ -331,12 +352,12 @@ class InventoryExplorer:
             classes[cls].append(dev)
         
         for cls, devs in sorted(classes.items()):
-            class_item = self.tree.insert(computer_item, 'end', text=f'📁 {cls}', values=('', '', '', '', ''))
+            class_item = self.tree.insert(computer_item, 'end', text=f'📁 {cls}', values=('', '', '', '', '', ''))
             for dev in devs:
                 self.tree.insert(class_item, 'end', 
                     text=f'  {dev.get("device_name", "Unknown")}',
                     values=(dev.get('device_id', ''), dev.get('manufacturer', ''), 
-                           dev.get('driver_version', ''), dev.get('status', ''), ''))
+                           dev.get('driver_version', ''), dev.get('status', ''), '', ''))
 
     def _on_select(self, event):
         item = self.tree.focus()

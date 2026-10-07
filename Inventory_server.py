@@ -80,7 +80,8 @@ class DatabaseManager:
                     cpu_info TEXT,
                     ram_total_gb REAL,
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_heartbeat TIMESTAMP
                 )
             ''')
             cursor.execute('''
@@ -102,6 +103,11 @@ class DatabaseManager:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_devices_computer ON devices(computer_id)
             ''')
+            # Add last_heartbeat column if not exists (for existing databases)
+            try:
+                cursor.execute('ALTER TABLE computers ADD COLUMN last_heartbeat TIMESTAMP')
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
         logger.info("Database initialized")
 
@@ -164,6 +170,40 @@ class DatabaseManager:
             ''', (computer_id,))
             return cursor.fetchall()
 
+    def update_heartbeat(self, ip_address: str):
+        """Update last_heartbeat for a computer by IP"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE computers SET last_heartbeat = ? WHERE ip_address = ?
+            ''', (datetime.now().isoformat(), ip_address))
+            conn.commit()
+
+    def get_online_computers(self, timeout_seconds: int = 120):
+        """Get computers that sent heartbeat within timeout"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, hostname, ip_address, mac_address, os_name, os_version,
+                cpu_info, ram_total_gb, last_seen, last_heartbeat
+                FROM computers 
+                WHERE last_heartbeat IS NOT NULL 
+                AND datetime(last_heartbeat) > datetime('now', ?)
+                ORDER BY hostname
+            ''', (f'-{timeout_seconds} seconds',))
+            return cursor.fetchall()
+
+    def get_computer_status(self):
+        """Get all computers with their online status"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, hostname, ip_address, mac_address, os_name, os_version,
+                cpu_info, ram_total_gb, last_seen, last_heartbeat
+                FROM computers ORDER BY hostname
+            ''')
+            return cursor.fetchall()
+
 
 class APIRequestHandler(BaseHTTPRequestHandler):
     def __init__(self, *args, db_manager=None, **kwargs):
@@ -176,6 +216,8 @@ class APIRequestHandler(BaseHTTPRequestHandler):
         
         if path == '/api/computers':
             self._handle_get_computers()
+        elif path == '/api/online':
+            self._handle_get_online()
         elif path.startswith('/api/computers/') and path.endswith('/devices'):
             computer_id = path.split('/')[3]
             self._handle_get_devices(computer_id)
@@ -194,7 +236,40 @@ class APIRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_get_computers(self):
         try:
-            computers = self.db_manager.get_all_computers()
+            computers = self.db_manager.get_computer_status()
+            result = []
+            for c in computers:
+                # Determine online status (heartbeat within 120 seconds)
+                is_online = False
+                if c[9]:  # last_heartbeat
+                    try:
+                        hb = datetime.fromisoformat(c[9].replace('Z', '+00:00'))
+                        if (datetime.now() - hb).total_seconds() < 120:
+                            is_online = True
+                    except:
+                        pass
+                
+                result.append({
+                    'id': c[0],
+                    'hostname': c[1],
+                    'ip_address': c[2],
+                    'mac_address': c[3],
+                    'os_name': c[4],
+                    'os_version': c[5],
+                    'cpu_info': c[6],
+                    'ram_total_gb': c[7],
+                    'last_seen': c[8],
+                    'last_heartbeat': c[9],
+                    'is_online': is_online
+                })
+            self._send_json(result)
+        except Exception as e:
+            logger.error(f"API error getting computers: {e}")
+            self._send_json({'error': str(e)}, 500)
+
+    def _handle_get_online(self):
+        try:
+            computers = self.db_manager.get_online_computers(120)
             result = []
             for c in computers:
                 result.append({
@@ -206,11 +281,15 @@ class APIRequestHandler(BaseHTTPRequestHandler):
                     'os_version': c[5],
                     'cpu_info': c[6],
                     'ram_total_gb': c[7],
-                    'last_seen': c[8]
+                    'last_seen': c[8],
+                    'last_heartbeat': c[9]
                 })
-            self._send_json(result)
+            self._send_json({
+                'online_count': len(result),
+                'computers': result
+            })
         except Exception as e:
-            logger.error(f"API error getting computers: {e}")
+            logger.error(f"API error getting online: {e}")
             self._send_json({'error': str(e)}, 500)
 
     def _handle_get_devices(self, computer_id):
@@ -407,6 +486,8 @@ class NetworkListener:
                 'ram_total_gb': data.get('ram_total_gb'),
             }
             computer_id = self.db_manager.upsert_computer(computer_data)
+            # Update heartbeat
+            self.db_manager.update_heartbeat(ip_address)
             devices = data.get('devices', [])
             if devices:
                 self.db_manager.save_devices(computer_id, devices)
