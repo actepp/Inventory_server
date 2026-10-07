@@ -18,6 +18,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_os_display_name(os_name: str, os_version: str) -> str:
+    """Get proper OS display name (e.g., Windows 11 vs Windows 10)"""
+    if os_name == 'Windows':
+        try:
+            build = int(os_version.split('.')[-1]) if '.' in os_version else 0
+            if build >= 22000:
+                return f'Windows 11 (build {build})'
+        except:
+            pass
+        return f'Windows 10 (build {os_version})'
+    return f'{os_name} {os_version}'.strip()
+
+
 def get_base_dir():
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent
@@ -293,7 +306,7 @@ class InventoryExplorer:
             self._add_system_info_nodes(item_id, comp)
             
             # Add placeholder for devices
-            self.tree.insert(item_id, 'end', text='📁 Устройства (загрузка...)', values=('', ''))
+            self.tree.insert(item_id, 'end', text='Загрузка...', values=('', ''))
         
         self.status_var.set(f"Найдено ПК: {len(computers)}")
 
@@ -306,7 +319,7 @@ class InventoryExplorer:
         # OS
         os_name = comp.get('os_name', 'Unknown')
         os_version = comp.get('os_version', '')
-        os_info = f'{os_name} {os_version}'.strip()
+        os_info = get_os_display_name(os_name, os_version)
         self.tree.insert(parent_item, 'end', text='🖥 Операционная система', values=('', os_info))
         
         # CPU
@@ -337,24 +350,42 @@ class InventoryExplorer:
         if not item:
             return
         
+        logger.info(f"Tree opened: item={item}, text='{self.tree.item(item, 'text')}'")
+        
         # Check if this is a computer node (has children with placeholder)
         children = self.tree.get_children(item)
-        if children and self.tree.item(children[0], 'text') == 'Загрузка...':
-            self.tree.delete(children[0])
-            self._load_devices(item)
+        logger.info(f"Children: {children}")
+        if children:
+            for child in children:
+                child_text = self.tree.item(child, 'text')
+                logger.info(f"  Child: '{child_text}'")
+                if child_text == 'Загрузка...':
+                    logger.info("Found placeholder, loading devices")
+                    self.tree.delete(child)
+                    self._load_devices(item)
+                    return
 
     def _load_devices(self, computer_item):
         comp_id = None
+        computer_text = self.tree.item(computer_item, 'text').strip()
+        logger.info(f"Loading devices for computer: '{computer_text}'")
         for cid, comp in self.computers_data.items():
-            if self.tree.item(computer_item, 'text').strip() == comp['hostname']:
+            logger.info(f"  Checking comp: {comp['hostname']} (id={cid})")
+            if computer_text == comp['hostname']:
                 comp_id = cid
                 break
         
         if not comp_id:
+            logger.error(f"Computer ID not found for: '{computer_text}'")
             return
+        
+        logger.info(f"Found computer ID: {comp_id}")
         
         try:
             devices = self.api_client.get_devices(comp_id)
+            logger.info(f"Got {len(devices)} devices from API")
+            for d in devices:
+                logger.info(f"  Device: class={d.get('device_class')}, name={d.get('device_name')}")
             self._populate_devices(computer_item, devices)
         except Exception as e:
             logger.error(f"Failed to load devices: {e}")
