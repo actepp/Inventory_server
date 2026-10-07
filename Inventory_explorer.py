@@ -145,13 +145,11 @@ class InventoryExplorer:
         
         self.computers_data = {}
         self.selected_computer_id = None
-        self.auto_refresh = True
-        self.refresh_thread = None
         
         self._setup_styles()
         self._create_ui()
         self._create_menu()
-        self._start_auto_refresh()
+        self._refresh_data()
         
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -229,11 +227,6 @@ class InventoryExplorer:
         file_menu.add_command(label="Выход", command=self._on_close)
         menubar.add_cascade(label="Файл", menu=file_menu)
 
-        view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_checkbutton(label="Автообновление", variable=tk.BooleanVar(value=self.auto_refresh),
-                                  command=self._toggle_auto_refresh)
-        menubar.add_cascade(label="Вид", menu=view_menu)
-
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="О программе", command=self._show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
@@ -246,24 +239,6 @@ class InventoryExplorer:
         if item:
             self.tree.selection_set(item)
             self.context_menu.post(event.x_root, event.y_root)
-
-    def _start_auto_refresh(self):
-        self.auto_refresh = True
-        if self.refresh_thread and self.refresh_thread.is_alive():
-            return
-        self.refresh_thread = threading.Thread(target=self._auto_refresh_loop, daemon=True)
-        self.refresh_thread.start()
-
-    def _auto_refresh_loop(self):
-        while self.auto_refresh:
-            time.sleep(30)  # Refresh every 30 seconds
-            if self.auto_refresh:
-                self.root.after(0, self._refresh_data)
-
-    def _toggle_auto_refresh(self):
-        self.auto_refresh = not self.auto_refresh
-        if self.auto_refresh:
-            self._start_auto_refresh()
 
     def _refresh_data(self):
         self.status_var.set("Загрузка...")
@@ -279,6 +254,9 @@ class InventoryExplorer:
             self.root.after(0, lambda err=e: self._show_error(f"Ошибка загрузки: {err}"))
 
     def _update_tree(self, computers, online_data=None):
+        # Save expanded hostnames before rebuilding
+        expanded_hostnames = self._get_expanded_hostnames()
+        
         self.tree.delete(*self.tree.get_children())
         self.computers_data = {}
         
@@ -290,6 +268,9 @@ class InventoryExplorer:
         total_count = len(computers)
         self.online_var.set(f"Онлайн: {online_count} / {total_count}")
 
+        # Track item_ids of computers that were expanded
+        expanded_items = []
+        
         for comp in computers:
             comp_id = comp['id']
             self.computers_data[comp_id] = comp
@@ -307,8 +288,26 @@ class InventoryExplorer:
             
             # Add placeholder for devices
             self.tree.insert(item_id, 'end', text='Загрузка...', values=('', ''))
+            
+            # Restore expanded state for this computer
+            if comp['hostname'] in expanded_hostnames:
+                self.tree.item(item_id, open=True)
+                expanded_items.append(item_id)
+        
+        # Load devices for computers that were expanded
+        for item_id in expanded_items:
+            self._load_devices(item_id)
         
         self.status_var.set(f"Найдено ПК: {len(computers)}")
+
+    def _get_expanded_hostnames(self):
+        """Get hostnames of expanded computer nodes"""
+        expanded = set()
+        for item in self.tree.get_children():
+            if self.tree.item(item, 'open'):
+                hostname = self.tree.item(item, 'text').strip()
+                expanded.add(hostname)
+        return expanded
 
     def _add_system_info_nodes(self, parent_item, comp):
         """Add system info as child nodes under computer"""
@@ -350,17 +349,12 @@ class InventoryExplorer:
         if not item:
             return
         
-        logger.info(f"Tree opened: item={item}, text='{self.tree.item(item, 'text')}'")
-        
         # Check if this is a computer node (has children with placeholder)
         children = self.tree.get_children(item)
-        logger.info(f"Children: {children}")
         if children:
             for child in children:
                 child_text = self.tree.item(child, 'text')
-                logger.info(f"  Child: '{child_text}'")
                 if child_text == 'Загрузка...':
-                    logger.info("Found placeholder, loading devices")
                     self.tree.delete(child)
                     self._load_devices(item)
                     return
@@ -368,24 +362,16 @@ class InventoryExplorer:
     def _load_devices(self, computer_item):
         comp_id = None
         computer_text = self.tree.item(computer_item, 'text').strip()
-        logger.info(f"Loading devices for computer: '{computer_text}'")
         for cid, comp in self.computers_data.items():
-            logger.info(f"  Checking comp: {comp['hostname']} (id={cid})")
             if computer_text == comp['hostname']:
                 comp_id = cid
                 break
         
         if not comp_id:
-            logger.error(f"Computer ID not found for: '{computer_text}'")
             return
-        
-        logger.info(f"Found computer ID: {comp_id}")
         
         try:
             devices = self.api_client.get_devices(comp_id)
-            logger.info(f"Got {len(devices)} devices from API")
-            for d in devices:
-                logger.info(f"  Device: class={d.get('device_class')}, name={d.get('device_name')}")
             self._populate_devices(computer_item, devices)
         except Exception as e:
             logger.error(f"Failed to load devices: {e}")
@@ -499,7 +485,6 @@ class InventoryExplorer:
             "Версия 1.0")
 
     def _on_close(self):
-        self.auto_refresh = False
         self.root.destroy()
 
     def run(self):

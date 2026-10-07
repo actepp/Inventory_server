@@ -298,28 +298,148 @@ class SystemInfoCollector:
         return devices
 
     def _get_monitor_info(self):
-        """Get monitor info"""
+        """Get monitor info with actual current resolution from video controllers"""
         devices = []
+        monitor_details = {}
+        
+        # Get actual current resolutions from video controllers (per-GPU)
+        video_resolutions = []
         try:
             wmi_conn = self._get_wmi_conn()
             if wmi_conn:
+                for vc in wmi_conn.Win32_VideoController():
+                    if vc.CurrentHorizontalResolution and vc.CurrentVerticalResolution:
+                        w = vc.CurrentHorizontalResolution
+                        h = vc.CurrentVerticalResolution
+                        video_resolutions.append((w, h))
+        except Exception as e:
+            logger.warning(f"Video controller resolution collection failed: {e}")
+        
+        # Sort by area descending (highest resolution first)
+        video_resolutions.sort(key=lambda r: r[0] * r[1], reverse=True)
+        
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                # First, get detailed monitor info from WmiMonitorID (root\wmi)
+                try:
+                    wmi_root = wmi.WMI(namespace='root\\wmi')
+                    for m in wmi_root.WmiMonitorID():
+                        instance_name = m.InstanceName.strip() if m.InstanceName else ""
+                        # Decode byte arrays to strings
+                        def decode_bytes(byte_array):
+                            if byte_array:
+                                return ''.join(chr(b) for b in byte_array if b != 0)
+                            return ""
+                        
+                        user_friendly = decode_bytes(m.UserFriendlyName)
+                        manufacturer = decode_bytes(m.ManufacturerName)
+                        product_code = decode_bytes(m.ProductCodeID)
+                        serial = decode_bytes(m.SerialNumberID)
+                        
+                        if instance_name:
+                            monitor_details[instance_name] = {
+                                'name': user_friendly or "Unknown Monitor",
+                                'manufacturer': manufacturer or "Unknown",
+                                'product_code': product_code,
+                                'serial': serial
+                            }
+                except Exception as e:
+                    logger.warning(f"WmiMonitorID collection failed: {e}")
+                
+                # Now get Win32_DesktopMonitor and match with detailed info
+                # First, collect all monitors from WMI
+                wmi_monitors = []
                 for monitor in wmi_conn.Win32_DesktopMonitor():
                     name = monitor.Name.strip() if monitor.Name else "Unknown Monitor"
                     manufacturer = monitor.MonitorManufacturer.strip() if monitor.MonitorManufacturer else "Unknown"
                     monitor_type = monitor.MonitorType.strip() if monitor.MonitorType else "Unknown"
-                    screen_width = monitor.ScreenWidth if monitor.ScreenWidth else 0
-                    screen_height = monitor.ScreenHeight if monitor.ScreenHeight else 0
                     pnp_device_id = monitor.PNPDeviceID.strip() if monitor.PNPDeviceID else "Unknown"
                     
-                    resolution = f'{screen_width}x{screen_height}' if screen_width and screen_height else 'Unknown'
+                    # Get resolution from monitor's reported resolution (EDID preferred)
+                    resolution = 'Unknown'
+                    screen_width = monitor.ScreenWidth if monitor.ScreenWidth else 0
+                    screen_height = monitor.ScreenHeight if monitor.ScreenHeight else 0
+                    has_edid_resolution = False
+                    if screen_width and screen_height:
+                        resolution = f'{screen_width}x{screen_height}'
+                        has_edid_resolution = True
+                    
+                    # Try to match with detailed info from WmiMonitorID
+                    detailed = None
+                    pnp_lower = pnp_device_id.lower()
+                    for inst_name, info in monitor_details.items():
+                        inst_lower = inst_name.lower()
+                        if inst_lower.startswith(pnp_lower) or pnp_lower in inst_lower:
+                            detailed = info
+                            break
+                    
+                    if detailed:
+                        display_name = detailed['name']
+                        display_manufacturer = detailed['manufacturer']
+                        extra_info = f"Product: {detailed['product_code']}, Serial: {detailed['serial']}"
+                    else:
+                        display_name = name
+                        display_manufacturer = manufacturer
+                        extra_info = ""
+                    
+                    wmi_monitors.append({
+                        'display_name': display_name,
+                        'display_manufacturer': display_manufacturer,
+                        'extra_info': extra_info,
+                        'monitor_type': monitor_type,
+                        'pnp_device_id': pnp_device_id,
+                        'resolution': resolution,
+                        'has_edid_resolution': has_edid_resolution,
+                        'status': monitor.Status.strip() if monitor.Status else 'OK'
+                    })
+                
+# Now assign actual resolutions from video controllers
+                # Build a set of GPU resolutions for quick lookup
+                gpu_resolutions = set()
+                for w, h in video_resolutions:
+                    gpu_resolutions.add((w, h))
+                
+                # Track which video resolutions have been assigned
+                assigned_resolutions = set()
+                
+                for wmi_mon in wmi_monitors:
+                    final_resolution = wmi_mon['resolution']
+                    
+                    # If no EDID resolution, report Unknown (can't reliably map to GPU)
+                    if not wmi_mon['has_edid_resolution']:
+                        final_resolution = 'Unknown'
+                    # If EDID resolution matches a GPU resolution, monitor is likely on that GPU
+                    # Use the GPU's current resolution (which may be higher than EDID preferred)
+                    elif wmi_mon['has_edid_resolution'] and video_resolutions:
+                        edid_width = wmi_mon['resolution'].split('x')[0] if 'x' in wmi_mon['resolution'] else 0
+                        edid_height = wmi_mon['resolution'].split('x')[1] if 'x' in wmi_mon['resolution'] else 0
+                        try:
+                            edid_w = int(edid_width)
+                            edid_h = int(edid_height)
+                            # Check if EDID resolution matches any GPU resolution
+                            if (edid_w, edid_h) in gpu_resolutions:
+                                # Find the matching GPU and use its resolution
+                                for i, (w, h) in enumerate(video_resolutions):
+                                    if i not in assigned_resolutions and w == edid_w and h == edid_h:
+                                        final_resolution = f"{w}x{h}"
+                                        assigned_resolutions.add(i)
+                                        break
+                            # If EDID doesn't match any GPU, keep EDID resolution
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    driver_version = f'Type: {wmi_mon["monitor_type"]}, Resolution: {final_resolution}'
+                    if wmi_mon['extra_info']:
+                        driver_version += f', {wmi_mon["extra_info"]}'
                     
                     devices.append({
                         'class': 'Monitor',
-                        'name': f'{name} ({resolution})',
-                        'device_id': pnp_device_id,
-                        'manufacturer': manufacturer,
-                        'driver_version': f'Type: {monitor_type}, Resolution: {resolution}',
-                        'status': monitor.Status.strip() if monitor.Status else 'OK'
+                        'name': f'{wmi_mon["display_name"]} ({final_resolution})',
+                        'device_id': wmi_mon['pnp_device_id'],
+                        'manufacturer': wmi_mon['display_manufacturer'],
+                        'driver_version': driver_version,
+                        'status': wmi_mon['status']
                     })
         except Exception as e:
             logger.warning(f"Monitor collection failed: {e}")

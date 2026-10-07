@@ -53,6 +53,7 @@ def get_base_dir():
 CONFIG_FILE = get_base_dir() / "server_config.json"
 DB_FILE = get_base_dir() / "inventory.db"
 DEFAULT_PORT = 5001
+DEFAULT_API_PORT = 5002
 
 logging.basicConfig(
     level=logging.INFO,
@@ -376,10 +377,15 @@ class ConfigManager:
         if self.config_path.exists():
             try:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    config = json.load(f)
+                    # Migration: add api_port if missing
+                    if 'api_port' not in config:
+                        config['api_port'] = DEFAULT_API_PORT
+                        self.save(config)
+                    return config
             except Exception as e:
                 logger.error(f"Failed to load config: {e}")
-        return {'port': DEFAULT_PORT}
+        return {'port': DEFAULT_PORT, 'api_port': DEFAULT_API_PORT}
 
     def save(self, config: dict):
         try:
@@ -396,6 +402,13 @@ class ConfigManager:
 
     def set_port(self, port: int):
         self.config['port'] = port
+        self.save(self.config)
+
+    def get_api_port(self):
+        return self.config.get('api_port', DEFAULT_API_PORT)
+
+    def set_api_port(self, api_port: int):
+        self.config['api_port'] = api_port
         self.save(self.config)
 
 
@@ -502,12 +515,13 @@ class NetworkListener:
 
 
 class SettingsWindow:
-    def __init__(self, parent, config_manager: ConfigManager, on_port_change):
+    def __init__(self, parent, config_manager: ConfigManager, on_port_change, on_api_port_change):
         self.config_manager = config_manager
         self.on_port_change = on_port_change
+        self.on_api_port_change = on_api_port_change
         self.window = tk.Toplevel(parent)
         self.window.title("Настройки сервера инвентаризации")
-        self.window.geometry("300x180")
+        self.window.geometry("300x250")
         self.window.resizable(False, False)
         self.window.protocol("WM_DELETE_WINDOW", self.on_cancel)
 
@@ -521,7 +535,7 @@ class SettingsWindow:
         main_frame = ttk.Frame(self.window, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(main_frame, text="Порт для прослушивания:").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text="Порт для прослушивания (клиенты):").pack(anchor=tk.W, pady=(0, 5))
 
         current_port = self.config_manager.get_port()
         if not current_port:
@@ -529,6 +543,15 @@ class SettingsWindow:
         self.port_var = tk.StringVar(value=str(current_port))
         port_entry = ttk.Entry(main_frame, textvariable=self.port_var, width=20)
         port_entry.pack(fill=tk.X, pady=(0, 15))
+
+        ttk.Label(main_frame, text="Порт API (обозреватель):").pack(anchor=tk.W, pady=(0, 5))
+
+        current_api_port = self.config_manager.get_api_port()
+        if not current_api_port:
+            current_api_port = DEFAULT_API_PORT
+        self.api_port_var = tk.StringVar(value=str(current_api_port))
+        api_port_entry = ttk.Entry(main_frame, textvariable=self.api_port_var, width=20)
+        api_port_entry.pack(fill=tk.X, pady=(0, 15))
 
         # Spacer to push buttons to bottom
         ttk.Frame(main_frame).pack(fill=tk.BOTH, expand=True)
@@ -548,13 +571,20 @@ class SettingsWindow:
     def on_save(self):
         try:
             port = int(self.port_var.get())
+            api_port = int(self.api_port_var.get())
             if not (1 <= port <= 65535):
                 raise ValueError("Port out of range")
+            if not (1 <= api_port <= 65535):
+                raise ValueError("API port out of range")
+            if port == api_port:
+                raise ValueError("Ports must be different")
             self.config_manager.set_port(port)
+            self.config_manager.set_api_port(api_port)
             self.on_port_change(port)
+            self.on_api_port_change(api_port)
             self.window.destroy()
-        except ValueError:
-            messagebox.showerror("Ошибка", "Введите корректный порт (1-65535)")
+        except ValueError as e:
+            messagebox.showerror("Ошибка", str(e))
 
     def on_cancel(self):
         self.window.destroy()
@@ -573,7 +603,7 @@ class InventoryServer:
         self.config_manager = ConfigManager(CONFIG_FILE)
         self.db_manager = DatabaseManager(DB_FILE)
         self.listener = NetworkListener(self.config_manager.get_port(), self.db_manager)
-        self.api_server = APIServer(self.config_manager.get_port() + 1, self.db_manager)
+        self.api_server = APIServer(self.config_manager.get_api_port(), self.db_manager)
         self.tray_icon = None
         self.root = tk.Tk()
         self.root.withdraw()
@@ -604,8 +634,13 @@ class InventoryServer:
             self.listener = NetworkListener(new_port, self.db_manager)
             self.listener.start()
 
+        def on_api_port_change(new_api_port):
+            self.api_server.stop()
+            self.api_server = APIServer(new_api_port, self.db_manager)
+            self.api_server.start()
+
         # Schedule in main thread to avoid threading issues with Tkinter
-        self.root.after(0, lambda: SettingsWindow(self.root, self.config_manager, on_port_change))
+        self.root.after(0, lambda: SettingsWindow(self.root, self.config_manager, on_port_change, on_api_port_change))
 
     def _exit_app(self, icon=None, item=None):
         self.listener.stop()
