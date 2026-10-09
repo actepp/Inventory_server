@@ -698,12 +698,18 @@ class InventoryExplorer:
                 else:
                     # Build info string for other device types
                     info_parts = []
-                    if manufacturer and manufacturer != 'Unknown':
-                        info_parts.append(f'Производитель: {manufacturer}')
-                    if driver_version and driver_version != 'Unknown' and driver_version != 'N/A':
-                        info_parts.append(f'Драйвер: {driver_version}')
-                    if device_id and device_id != 'Unknown':
-                        info_parts.append(f'ID: {device_id}')
+                    
+                    if cls == 'DiskDrive':
+                        # For disks, show only driver_version which contains: used, free, percent, filesystem
+                        if driver_version and driver_version != 'Unknown' and driver_version != 'N/A':
+                            info_parts.append(driver_version)
+                    else:
+                        if manufacturer and manufacturer != 'Unknown':
+                            info_parts.append(f'Производитель: {manufacturer}')
+                        if driver_version and driver_version != 'Unknown' and driver_version != 'N/A':
+                            info_parts.append(f'Драйвер: {driver_version}')
+                        if device_id and device_id != 'Unknown':
+                            info_parts.append(f'ID: {device_id}')
                     
                     info_text = ' | '.join(info_parts) if info_parts else ''
                     

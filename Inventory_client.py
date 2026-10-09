@@ -173,6 +173,7 @@ class SystemInfoCollector:
         gpu_info = self._get_gpu_info()
         monitor_info = self._get_monitor_info()
         motherboard_info = self._get_motherboard_info()
+        disk_info = self._get_disk_info()
         
         devices = self._get_devices()
         # Add detailed hardware as devices
@@ -181,6 +182,7 @@ class SystemInfoCollector:
         devices.extend(gpu_info)
         devices.extend(monitor_info)
         devices.extend(motherboard_info)
+        devices.extend(disk_info)
         
         data = {
             'hostname': platform.node(),
@@ -495,6 +497,60 @@ class SystemInfoCollector:
             logger.warning(f"Motherboard collection failed: {e}")
         return devices
 
+    def _get_disk_info(self):
+        """Get logical disk info with space usage"""
+        devices = []
+        try:
+            wmi_conn = self._get_wmi_conn()
+            if wmi_conn:
+                for disk in wmi_conn.Win32_LogicalDisk():
+                    # Only process fixed drives (type 3) and removable (type 2), skip network/ram/etc
+                    if disk.DriveType not in (2, 3):
+                        continue
+                    
+                    device_id = disk.DeviceID.strip() if disk.DeviceID else "Unknown"
+                    volume_name = disk.VolumeName.strip() if disk.VolumeName else ""
+                    filesystem = disk.FileSystem.strip() if disk.FileSystem else "Unknown"
+                    
+                    # Get sizes
+                    total_size = int(disk.Size) if disk.Size else 0
+                    free_space = int(disk.FreeSpace) if disk.FreeSpace else 0
+                    used_space = total_size - free_space if total_size > free_space else 0
+                    
+                    # Format sizes in GB
+                    total_gb = round(total_size / (1024**3), 2) if total_size else 0
+                    used_gb = round(used_space / (1024**3), 2) if used_space else 0
+                    free_gb = round(free_space / (1024**3), 2) if free_space else 0
+                    
+                    # Build display name
+                    display_name = f"Диск {device_id}"
+                    if volume_name:
+                        display_name += f" ({volume_name})"
+                    
+                    # Build detail string
+                    details = []
+                    details.append(f"Занято: {used_gb} ГБ из {total_gb} ГБ")
+                    details.append(f"Свободно: {free_gb} ГБ")
+                    
+                    # Percentage
+                    if total_size > 0:
+                        percent_used = round((used_space / total_size) * 100, 1)
+                        details.append(f"({percent_used}% занято)")
+                    
+                    details.append(f"ФС: {filesystem}")
+                    
+                    devices.append({
+                        'class': 'DiskDrive',
+                        'name': display_name,
+                        'device_id': device_id,
+                        'manufacturer': 'Microsoft',
+                        'driver_version': ' | '.join(details),
+                        'status': 'OK'
+                    })
+        except Exception as e:
+            logger.warning(f"Disk info collection failed: {e}")
+        return devices
+
     def _get_network_adapters(self):
         """Get network adapters with detailed configuration"""
         devices = []
@@ -728,20 +784,7 @@ class SystemInfoCollector:
         """Fallback device collection using basic system info (for non-WMI systems)"""
         devices = []
         try:
-            # Add disk info
-            for partition in psutil.disk_partitions():
-                try:
-                    usage = psutil.disk_usage(partition.mountpoint)
-                    devices.append({
-                        'class': 'DiskDrive',
-                        'name': f'{partition.device} ({partition.fstype})',
-                        'device_id': partition.device,
-                        'manufacturer': 'Unknown',
-                        'driver_version': 'N/A',
-                        'status': 'OK'
-                    })
-                except:
-                    pass
+            # Note: DiskDrive is now collected via WMI in _get_disk_info(), skip here to avoid duplicates
             # Add network interfaces
             for name, addrs in psutil.net_if_addrs().items():
                 for addr in addrs:
