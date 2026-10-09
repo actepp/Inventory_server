@@ -480,9 +480,11 @@ class SystemInfoCollector:
             if wmi_conn:
                 # Get adapter configurations (IP, DNS, DHCP, etc.) - keyed by normalized MAC
                 adapter_configs = {}
+                adapter_configs_by_name = {}  # Fallback for adapters without MAC
                 for nac in wmi_conn.Win32_NetworkAdapterConfiguration():
-                    if nac.IPEnabled and nac.MACAddress:
-                        mac = nac.MACAddress.strip().lower().replace(':', '').replace('-', '')
+                    if nac.IPEnabled:
+                        mac = nac.MACAddress.strip().lower().replace(':', '').replace('-', '') if nac.MACAddress else ''
+                        name = nac.Description.strip() if nac.Description else "Unknown"
                         ip_list = nac.IPAddress if nac.IPAddress else []
                         ip_str = ', '.join(ip_list) if ip_list else 'N/A'
                         subnet_list = nac.IPSubnet if nac.IPSubnet else []
@@ -494,7 +496,7 @@ class SystemInfoCollector:
                         dhcp_enabled = 'Да' if nac.DHCPEnabled else 'Нет'
                         dhcp_server = nac.DHCPServer if nac.DHCPServer else 'N/A'
                         
-                        adapter_configs[mac] = {
+                        config = {
                             'ip': ip_str,
                             'subnet': subnet_str,
                             'gateway': gateway_str,
@@ -502,6 +504,10 @@ class SystemInfoCollector:
                             'dhcp_enabled': dhcp_enabled,
                             'dhcp_server': dhcp_server,
                         }
+                        if mac:
+                            adapter_configs[mac] = config
+                        # Always store by name as fallback
+                        adapter_configs_by_name[name.lower()] = config
                 
                 # Get physical adapters with speed - build lookup by normalized MAC
                 adapter_speeds = {}
@@ -528,6 +534,7 @@ class SystemInfoCollector:
                         adapter_manufacturers[mac] = na.Manufacturer.strip() if na.Manufacturer else "Unknown"
                 
                 # Combine: for each adapter with IP config, add device
+                processed_names = set()
                 for mac, config in adapter_configs.items():
                     name = adapter_names.get(mac, "Unknown")
                     manufacturer = adapter_manufacturers.get(mac, "Unknown")
@@ -576,6 +583,70 @@ class SystemInfoCollector:
                     devices.append({
                         'class': 'NetworkAdapter',
                         'name': name,
+                        'device_id': mac_display,
+                        'manufacturer': manufacturer,
+                        'driver_version': ' | '.join(details),
+                        'status': 'OK'
+                    })
+                    processed_names.add(name_lower)
+                
+                # Handle adapters with IP config but NO MAC (like OpenVPN Data Channel Offload)
+                for name, config in adapter_configs_by_name.items():
+                    if name in processed_names:
+                        continue  # Already processed via MAC
+                    
+                    # Try to find matching physical adapter by name
+                    matched_mac = None
+                    for mac, phys_name in adapter_names.items():
+                        if phys_name.lower() == name:
+                            matched_mac = mac
+                            break
+                    
+                    manufacturer = "Unknown"
+                    speed_str = 'N/A'
+                    mac_display = "N/A"
+                    if matched_mac:
+                        manufacturer = adapter_manufacturers.get(matched_mac, "Unknown")
+                        speed_str = adapter_speeds.get(matched_mac, 'N/A')
+                        mac_display = ':'.join([matched_mac[i:i+2] for i in range(0, 12, 2)]) if len(matched_mac) == 12 else matched_mac
+                    
+                    details = []
+                    details.append(f'MAC: {mac_display}')
+                    details.append(f'Скорость: {speed_str}')
+                    if config.get('ip') != 'N/A':
+                        details.append(f'IP: {config["ip"]}')
+                    if config.get('subnet') != 'N/A':
+                        details.append(f'Маска: {config["subnet"]}')
+                    if config.get('gateway') != 'N/A':
+                        details.append(f'Шлюз: {config["gateway"]}')
+                    if config.get('dns') != 'N/A':
+                        details.append(f'DNS: {config["dns"]}')
+                    details.append(f'DHCP: {config.get("dhcp_enabled", "N/A")}')
+                    if config.get('dhcp_server') != 'N/A':
+                        details.append(f'DHCP сервер: {config["dhcp_server"]}')
+                    
+                    # Check meaningful details
+                    meaningful_details = [d for d in details if not d.startswith('MAC:') and not (d.startswith('Скорость:') and d.endswith('N/A'))]
+                    has_ip_config = config.get('ip') != 'N/A' or config.get('subnet') != 'N/A'
+                    
+                    # Skip virtual without IP config
+                    is_virtual = any(kw in name for kw in [
+                        'loopback', 'wan miniport', 'pseudo', 'virtual', 'hyper-v', 
+                        'docker', 'vmware', 'virtualbox'
+                    ])
+                    if is_virtual and not has_ip_config:
+                        continue
+                    
+                    if not meaningful_details:
+                        continue
+                    
+                    # Use original name from NAC Description
+                    original_name = next((nac.Description.strip() for nac in wmi_conn.Win32_NetworkAdapterConfiguration() 
+                                         if nac.IPEnabled and nac.Description and nac.Description.strip().lower() == name), name)
+                    
+                    devices.append({
+                        'class': 'NetworkAdapter',
+                        'name': original_name,
                         'device_id': mac_display,
                         'manufacturer': manufacturer,
                         'driver_version': ' | '.join(details),
