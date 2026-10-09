@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+import queue
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -41,6 +42,7 @@ CONFIG_FILE = get_base_dir() / "explorer_config.json"
 DEFAULT_SERVER_IP = "127.0.0.1"
 DEFAULT_SERVER_PORT = 5001
 DEFAULT_API_PORT = 5002
+DEFAULT_CHECK_INTERVAL = 30  # seconds
 EXPLORER_VERSION = "1.0.0"
 
 
@@ -53,14 +55,20 @@ class ExplorerConfig:
         if self.config_path.exists():
             try:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    config = json.load(f)
+                    # Migration: add check_interval if missing
+                    if 'check_interval' not in config:
+                        config['check_interval'] = DEFAULT_CHECK_INTERVAL
+                        self.save(config)
+                    return config
             except Exception as e:
                 logger.error(f"Failed to load config: {e}")
         # First run - create default config
         default_config = {
             'server_ip': DEFAULT_SERVER_IP,
             'server_port': DEFAULT_SERVER_PORT,
-            'api_port': DEFAULT_API_PORT
+            'api_port': DEFAULT_API_PORT,
+            'check_interval': DEFAULT_CHECK_INTERVAL
         }
         self.save(default_config)
         return default_config
@@ -85,10 +93,14 @@ class ExplorerConfig:
     def get_api_port(self):
         return self.config.get('api_port', DEFAULT_API_PORT)
 
-    def set_config(self, server_ip: str, server_port: int, api_port: int):
+    def get_check_interval(self):
+        return self.config.get('check_interval', DEFAULT_CHECK_INTERVAL)
+
+    def set_config(self, server_ip: str, server_port: int, api_port: int, check_interval: int):
         self.config['server_ip'] = server_ip
         self.config['server_port'] = server_port
         self.config['api_port'] = api_port
+        self.config['check_interval'] = check_interval
         self.save()
 
 
@@ -152,11 +164,17 @@ class InventoryExplorer:
         
         self.computers_data = {}
         self.selected_computer_id = None
+        self._status_check_running = True
+        self._was_offline = False
+        self._refreshing = False
+        self._msg_queue = queue.Queue()
         
         self._setup_styles()
         self._create_ui()
         self._create_menu()
         self._refresh_data()
+        self._start_status_checker()
+        self._process_queue()
         
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -178,6 +196,7 @@ class InventoryExplorer:
 
         ttk.Button(toolbar, text="📡 Опросить все", command=self._poll_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(toolbar, text="🗑 Удалить ПК", command=self._delete_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text="🔄 Обновить", command=self._refresh_data).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
         # Server agent status
@@ -247,6 +266,9 @@ class InventoryExplorer:
             self.context_menu.post(event.x_root, event.y_root)
 
     def _refresh_data(self):
+        if getattr(self, '_refreshing', False):
+            return
+        self._refreshing = True
         self.status_var.set("Загрузка...")
         threading.Thread(target=self._fetch_computers, daemon=True).start()
 
@@ -254,12 +276,22 @@ class InventoryExplorer:
         try:
             computers = self.api_client.get_computers()
             online_data = self.api_client.get_online()
-            self.root.after(0, lambda c=computers: self._update_tree(c))
-            self.root.after(0, lambda o=online_data: self._set_server_online(o))
+            self._msg_queue.put(('refresh_data', (computers, online_data)))
         except Exception as e:
             logger.error(f"Failed to fetch computers: {e}")
-            self.root.after(0, self._set_server_offline)
-            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка: {err}"))
+            self._msg_queue.put(('refresh_error', None))
+        finally:
+            self._msg_queue.put(('refresh_done', None))
+
+    def _handle_refresh_data(self, data):
+        computers, online_data = data
+        self._update_tree(computers)
+        self._set_server_online(online_data)
+
+    def _handle_refresh_error(self):
+        self._set_server_offline()
+        self._was_offline = True
+        self.status_var.set("Ошибка загрузки")
 
     def _set_server_online(self, online_data=None):
         server_version = online_data.get('server_version', '?') if online_data else '?'
@@ -475,7 +507,7 @@ class InventoryExplorer:
             self.root.after(0, lambda: self.status_var.set("Удалено"))
         except Exception as e:
             logger.error(f"Failed to delete computer: {e}")
-            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка удаления: {err}"))
+            self.root.after(0, lambda: self.status_var.set("Ошибка удаления"))
 
     def _poll_selected(self):
         if not self.selected_computer_id:
@@ -495,7 +527,7 @@ class InventoryExplorer:
             self.root.after(0, self._refresh_data)
         except Exception as e:
             logger.error(f"Failed to poll computer: {e}")
-            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка опроса: {err}"))
+            self.root.after(0, lambda: self.status_var.set("Ошибка опроса"))
 
     def _poll_all(self):
         self.status_var.set("Отправка команды опроса всем...")
@@ -507,7 +539,7 @@ class InventoryExplorer:
             self.root.after(0, lambda: self.status_var.set(f"Команда опроса всем отправлена: {result.get('message', 'OK')}"))
         except Exception as e:
             logger.error(f"Failed to poll all: {e}")
-            self.root.after(0, lambda err=e: self.status_var.set(f"Ошибка опроса всех: {err}"))
+            self.root.after(0, lambda: self.status_var.set("Ошибка опроса всех"))
 
     def _show_settings(self):
         SettingsWindow(self.root, self.config, self._on_config_change)
@@ -515,6 +547,7 @@ class InventoryExplorer:
     def _on_config_change(self):
         self.api_client = APIClient(self.config)
         self._refresh_data()
+        # Status checker will pick up new interval on next iteration
 
     def _show_about(self):
         messagebox.showinfo("О программе", 
@@ -523,11 +556,71 @@ class InventoryExplorer:
             "Версия 1.0")
 
     def _on_close(self):
+        self._status_check_running = False
         self.root.destroy()
 
     def run(self):
         self._refresh_data()
         self.root.mainloop()
+
+    def _start_status_checker(self):
+        """Start background thread to periodically check server status"""
+        def status_checker():
+            while self._status_check_running:
+                interval = self.config.get_check_interval()
+                if interval < 5:
+                    interval = 5  # minimum 5 seconds
+                time.sleep(interval)
+                if not self._status_check_running:
+                    break
+                if self._refreshing:
+                    continue
+                try:
+                    online_data = self.api_client.get_online()
+                    self._msg_queue.put(('server_online', online_data))
+                except Exception:
+                    self._msg_queue.put(('server_offline', None))
+        
+        threading.Thread(target=status_checker, daemon=True).start()
+
+    def _process_queue(self):
+        """Process messages from background thread in main UI thread"""
+        try:
+            while True:
+                msg_type, data = self._msg_queue.get_nowait()
+                if msg_type == 'server_online':
+                    self._handle_server_online(data)
+                elif msg_type == 'server_offline':
+                    self._handle_server_offline()
+                elif msg_type == 'refresh_data':
+                    self._handle_refresh_data(data)
+                elif msg_type == 'refresh_error':
+                    self._handle_refresh_error()
+                elif msg_type == 'refresh_done':
+                    self._refreshing = False
+                    self.status_var.set(f"Найдено ПК: {len(self.computers_data)}")
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(100, self._process_queue)
+
+    def _handle_server_online(self, online_data):
+        self._set_server_online(online_data)
+        online_count = online_data.get('online_count', 0) if online_data else 0
+        current_count = len(self.computers_data)
+        
+        if self._was_offline:
+            self._was_offline = False
+            self.status_var.set("Подключение восстановлено...")
+            self._refresh_data()
+        elif online_count != current_count and online_count > 0:
+            logger.info(f"Computer count changed: was {current_count}, now {online_count}")
+            self._refresh_data()
+
+    def _handle_server_offline(self):
+        if not self._was_offline:
+            self._was_offline = True
+        self._set_server_offline()
 
 
 class SettingsWindow:
@@ -536,7 +629,7 @@ class SettingsWindow:
         self.on_save_callback = on_save_callback
         self.window = tk.Toplevel(parent)
         self.window.title("Настройки Обозревателя")
-        self.window.geometry("400x250")
+        self.window.geometry("400x330")
         self.window.resizable(False, False)
         self.window.transient(parent)
         self.window.grab_set()
@@ -547,29 +640,46 @@ class SettingsWindow:
     def _create_widgets(self):
         main_frame = ttk.Frame(self.window, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.columnconfigure(1, weight=1)
 
         # Server IP
-        ttk.Label(main_frame, text="IP адрес сервера:").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text="IP адрес сервера:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
         self.ip_var = tk.StringVar(value=self.config.get_server_ip())
-        ttk.Entry(main_frame, textvariable=self.ip_var, width=30).pack(fill=tk.X, pady=(0, 10))
+        ttk.Entry(main_frame, textvariable=self.ip_var).grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
         # Server Port
-        ttk.Label(main_frame, text="Порт сервера (агенты):").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text="Порт сервера (агенты):").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
         self.port_var = tk.StringVar(value=str(self.config.get_server_port()))
-        ttk.Entry(main_frame, textvariable=self.port_var, width=30).pack(fill=tk.X, pady=(0, 10))
+        ttk.Entry(main_frame, textvariable=self.port_var).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
         # API Port
-        ttk.Label(main_frame, text="Порт API (веб):").pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text="Порт API (веб):").grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
         self.api_port_var = tk.StringVar(value=str(self.config.get_api_port()))
-        ttk.Entry(main_frame, textvariable=self.api_port_var, width=30).pack(fill=tk.X, pady=(0, 15))
+        ttk.Entry(main_frame, textvariable=self.api_port_var).grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
-        ttk.Frame(main_frame).pack(fill=tk.BOTH, expand=True)
+        # Check Interval
+        ttk.Label(main_frame, text="Интервал опроса сервера (сек):").grid(row=6, column=0, sticky=tk.W, pady=(0, 5))
+        self.check_interval_var = tk.StringVar(value=str(self.config.get_check_interval()))
+        ttk.Entry(main_frame, textvariable=self.check_interval_var).grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(0, 20))
 
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, side=tk.BOTTOM, anchor=tk.E)
+        # Spacer row
+        main_frame.rowconfigure(8, weight=1)
 
-        ttk.Button(btn_frame, text="Сохранить", command=self.on_save).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(btn_frame, text="Отмена", command=self.on_cancel).pack(side=tk.RIGHT)
+        # Separator
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(5, 10))
+
+        # Buttons - bottom right, using tk.Button for custom colors
+        btn_frame = tk.Frame(main_frame)
+        btn_frame.grid(row=10, column=0, columnspan=2, sticky=tk.E, pady=(0, 10))
+
+        # Cancel - red
+        tk.Button(btn_frame, text="Отмена", command=self.on_cancel, 
+                  bg='#e74c3c', fg='white', activebackground='#c0392b', activeforeground='white',
+                  relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT, padx=(0, 10))
+        # Save - green
+        tk.Button(btn_frame, text="Сохранить", command=self.on_save,
+                  bg='#27ae60', fg='white', activebackground='#219150', activeforeground='white',
+                  relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT)
 
     def _center_window(self, parent):
         self.window.update_idletasks()
@@ -585,6 +695,7 @@ class SettingsWindow:
             
             server_port = int(self.port_var.get())
             api_port = int(self.api_port_var.get())
+            check_interval = int(self.check_interval_var.get())
             
             for port in (server_port, api_port):
                 if not (1 <= port <= 65535):
@@ -593,7 +704,10 @@ class SettingsWindow:
             if server_port == api_port:
                 raise ValueError("Порты сервера и API должны отличаться")
             
-            self.config.set_config(server_ip, server_port, api_port)
+            if check_interval < 5:
+                raise ValueError("Интервал опроса не может быть меньше 5 секунд")
+            
+            self.config.set_config(server_ip, server_port, api_port, check_interval)
             self.on_save_callback()
             self.window.destroy()
         except ValueError as e:
