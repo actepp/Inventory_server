@@ -10,6 +10,7 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from packaging import version
 
 import tkinter as tk
 from tkinter import ttk, messagebox, font
@@ -149,6 +150,10 @@ DEFAULT_SERVER_PORT = 5001
 DEFAULT_API_PORT = 5002
 DEFAULT_CHECK_INTERVAL = 30  # seconds
 EXPLORER_VERSION = "1.0.0"
+
+# GitHub repository for updates (change to your repo)
+GITHUB_REPO = "actepp/Inventory_server"  # Формат: "username/repository"
+GITHUB_VERSION_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/version.txt"
 
 
 class ExplorerConfig:
@@ -415,7 +420,18 @@ class InventoryExplorer:
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
-            self.context_menu.post(event.x_root, event.y_root)
+            # Check if this is the client version node
+            item_text = self.tree.item(item, 'text').strip()
+            if item_text == '📦 Версия агент-клиента':
+                self._show_client_version_context_menu(event, item)
+            else:
+                self.context_menu.post(event.x_root, event.y_root)
+
+    def _show_client_version_context_menu(self, event, item):
+        """Show context menu for client version node"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Обновить агент", command=lambda: self._check_client_update(item))
+        menu.post(event.x_root, event.y_root)
 
     def _refresh_data(self):
         if getattr(self, '_refreshing', False):
@@ -752,6 +768,111 @@ class InventoryExplorer:
         except Exception as e:
             logger.error(f"Failed to poll all: {e}")
             self.root.after(0, lambda: self.status_var.set("Ошибка опроса всех"))
+
+    def _check_client_update(self, version_item):
+        """Check for client agent update from GitHub releases"""
+        # Get computer ID from parent item
+        computer_item = self.tree.parent(version_item)
+        if not computer_item:
+            return
+        
+        computer_text = self.tree.item(computer_item, 'text').strip()
+        comp_id = None
+        for cid, comp in self.computers_data.items():
+            if computer_text == comp['hostname']:
+                comp_id = cid
+                break
+        
+        if not comp_id:
+            return
+        
+        current_version = self.tree.item(version_item, 'values')[0] if self.tree.item(version_item, 'values') else '?'
+        self.status_var.set("Проверка обновлений...")
+        
+        threading.Thread(target=self._do_check_client_update, args=(comp_id, current_version, version_item), daemon=True).start()
+
+    def _do_check_client_update(self, comp_id, current_version, version_item):
+        """Background task to check for client update"""
+        try:
+            latest_version = self._fetch_latest_client_version()
+            if not latest_version:
+                self.root.after(0, lambda: self._show_update_result("Не удалось получить информацию о версии"))
+                return
+            
+            # Compare versions
+            try:
+                current_ver = version.parse(current_version)
+                latest_ver = version.parse(latest_version)
+            except Exception:
+                # Fallback to string comparison if parsing fails
+                current_ver = current_version
+                latest_ver = latest_version
+            
+            if latest_ver > current_ver:
+                self.root.after(0, lambda: self._prompt_update(comp_id, current_version, latest_version, version_item))
+            else:
+                self.root.after(0, lambda: self._show_update_result("Обновлений нет"))
+                
+        except Exception as e:
+            logger.error(f"Failed to check client update: {e}")
+            self.root.after(0, lambda: self._show_update_result(f"Ошибка проверки: {e}"))
+
+    def _fetch_latest_client_version(self):
+        """Fetch latest client version from GitHub releases version.txt"""
+        try:
+            req = urllib.request.Request(GITHUB_VERSION_URL, headers={'User-Agent': 'InventoryExplorer'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                content = response.read().decode('utf-8').strip()
+            
+            # Parse version.txt format:
+            # server 1.0.1
+            # client 1.0.1
+            # explorer 1.0.1
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith('client '):
+                    return line.split(' ', 1)[1].strip()
+            return None
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                logger.warning("version.txt not found in GitHub releases")
+            else:
+                logger.error(f"HTTP error fetching version.txt: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch version.txt: {e}")
+            return None
+
+    def _prompt_update(self, comp_id, current_version, latest_version, version_item):
+        """Show update confirmation dialog"""
+        self.status_var.set("Готов")
+        result = messagebox.askyesno(
+            "Обновление агента",
+            f"Доступна новая версия агент-клиента:\n"
+            f"Текущая: {current_version}\n"
+            f"Новая: {latest_version}\n\n"
+            f"Обновить агент на этом компьютере?"
+        )
+        if result:
+            self._start_client_update(comp_id, latest_version, version_item)
+        else:
+            self.status_var.set("Обновление отменено")
+
+    def _start_client_update(self, comp_id, latest_version, version_item):
+        """Start client update process (placeholder for now)"""
+        # TODO: Implement actual update mechanism
+        # For now just show a message
+        self.status_var.set("Функция обновления в разработке...")
+        messagebox.showinfo(
+            "Обновление",
+            f"Запуск обновления до версии {latest_version}...\n\n"
+            f"(Реальная механика обновления будет реализована позже)"
+        )
+
+    def _show_update_result(self, message):
+        """Show update check result"""
+        self.status_var.set("Готов")
+        messagebox.showinfo("Проверка обновлений", message)
 
     def _show_settings(self):
         SettingsWindow(self.root, self.config, self._on_config_change)
