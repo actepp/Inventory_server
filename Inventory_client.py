@@ -61,11 +61,34 @@ DEFAULT_INTERVAL_MINUTES = 0
 COMMAND_CHECK_INTERVAL = 30  # seconds
 CLIENT_VERSION = "1.0.0"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Setup logging with file handler for command tracing
+def setup_logger(name, log_file):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    
+    # Clear existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_format)
+    logger.addHandler(console_handler)
+    
+    # File handler for command tracing
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_format)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+base_dir = get_base_dir()
+logger = setup_logger('InventoryClient', base_dir / "Inventory_client.log")
+cmd_logger = setup_logger('InventoryClient.Commands', base_dir / "Inventory_client.log")
 
 
 class ClientConfigManager:
@@ -796,13 +819,15 @@ class ClientAgent:
     def _check_commands(self):
         """Lightweight check for POLL_NOW command without sending full inventory"""
         try:
+            server_ip = self.config_manager.get_server_ip()
+            server_port = self.config_manager.get_server_port()
             # Minimal payload - just hostname to identify
             data = {'hostname': platform.node(), 'command_check': True}
             json_data = json.dumps(data)
             
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(10.0)
-            sock.connect((self.config_manager.get_server_ip(), self.config_manager.get_server_port()))
+            sock.connect((server_ip, server_port))
             sock.sendall(json_data.encode('utf-8'))
             sock.shutdown(socket.SHUT_WR)
             
@@ -815,7 +840,10 @@ class ClientAgent:
             except json.JSONDecodeError:
                 commands = []
             
+            cmd_logger.info(f"COMMAND CHECK: Client -> Server ({server_ip}:{server_port}) | SENT command_check | RECEIVED commands={commands}")
+            
             if "POLL_NOW" in commands:
+                cmd_logger.info(f"COMMAND RECEIVED: Server -> Client | POLL_NOW | Triggering immediate inventory send")
                 logger.info("POLL_NOW received via command check, sending full inventory")
                 self._send_inventory()
                 
@@ -824,12 +852,14 @@ class ClientAgent:
 
     def _send_inventory(self):
         try:
+            server_ip = self.config_manager.get_server_ip()
+            server_port = self.config_manager.get_server_port()
             data = self.info_collector.collect()
             json_data = json.dumps(data)
             
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(15.0)
-            sock.connect((self.config_manager.get_server_ip(), self.config_manager.get_server_port()))
+            sock.connect((server_ip, server_port))
             sock.sendall(json_data.encode('utf-8'))
             sock.shutdown(socket.SHUT_WR)
             
@@ -846,11 +876,14 @@ class ClientAgent:
                 status = response
                 commands = []
             
+            cmd_logger.info(f"COMMAND SENT: Client -> Server ({server_ip}:{server_port}) | INVENTORY | RECEIVED status={status}, commands={commands}")
+            
             if status == "OK":
                 self._set_status("idle", "")
                 logger.info("Inventory sent successfully")
                 # Handle POLL_NOW command - immediately send again
                 if "POLL_NOW" in commands:
+                    cmd_logger.info(f"COMMAND RECEIVED: Server -> Client | POLL_NOW | Triggering immediate inventory re-send")
                     logger.info("POLL_NOW command received, sending inventory again")
                     self._send_inventory()  # Recursive call for immediate re-send
             elif status == "ERROR_FORMAT":

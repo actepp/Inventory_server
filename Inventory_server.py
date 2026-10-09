@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+import urllib.request
+import urllib.error
 
 import pystray
 from pystray._win32 import Icon as Win32Icon
@@ -56,11 +58,34 @@ DEFAULT_PORT = 5001
 DEFAULT_API_PORT = 5002
 SERVER_VERSION = "1.0.0"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Setup logging with file handler for command tracing
+def setup_logger(name, log_file):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    
+    # Clear existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_format)
+    logger.addHandler(console_handler)
+    
+    # File handler for command tracing
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_format)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+base_dir = get_base_dir()
+logger = setup_logger('InventoryServer', base_dir / "Inventory_server.log")
+cmd_logger = setup_logger('InventoryServer.Commands', base_dir / "Inventory_server.log")
 
 
 class DatabaseManager:
@@ -248,9 +273,56 @@ class DatabaseManager:
             conn.commit()
 
 
+class ExplorerNotifier:
+    """Manages registered explorers and sends push notifications"""
+    def __init__(self):
+        self.callbacks = []  # list of callback URLs
+        self.lock = threading.Lock()
+    
+    def register(self, callback_url: str):
+        """Register an explorer callback URL"""
+        with self.lock:
+            if callback_url not in self.callbacks:
+                self.callbacks.append(callback_url)
+                logger.info(f"Explorer registered: {callback_url}")
+    
+    def unregister(self, callback_url: str):
+        """Unregister an explorer callback URL"""
+        with self.lock:
+            if callback_url in self.callbacks:
+                self.callbacks.remove(callback_url)
+                logger.info(f"Explorer unregistered: {callback_url}")
+    
+    def notify_all(self):
+        """Send push notification to all registered explorers"""
+        with self.lock:
+            callbacks = list(self.callbacks)
+        
+        for callback_url in callbacks:
+            try:
+                req = urllib.request.Request(
+                    callback_url,
+                    data=json.dumps({'type': 'data_updated'}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=3) as response:
+                    if response.status == 200:
+                        cmd_logger.info(f"COMMAND SENT: Server -> Explorer ({callback_url}) | DATA_UPDATED")
+                    else:
+                        logger.warning(f"Explorer notification failed: {response.status}")
+            except Exception as e:
+                logger.warning(f"Failed to notify explorer {callback_url}: {e}")
+                # Remove dead callbacks
+                with self.lock:
+                    if callback_url in self.callbacks:
+                        self.callbacks.remove(callback_url)
+
+
 class APIRequestHandler(BaseHTTPRequestHandler):
-    def __init__(self, *args, db_manager=None, **kwargs):
+    def __init__(self, *args, db_manager=None, notifier=None, **kwargs):
         self.db_manager = db_manager
+        self.notifier = notifier
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
@@ -264,6 +336,10 @@ class APIRequestHandler(BaseHTTPRequestHandler):
         elif path.startswith('/api/computers/') and path.endswith('/devices'):
             computer_id = path.split('/')[3]
             self._handle_get_devices(computer_id)
+        elif path == '/api/explorer/register':
+            self._handle_explorer_register(parsed)
+        elif path == '/api/explorer/unregister':
+            self._handle_explorer_unregister(parsed)
         else:
             self._send_json({'error': 'Not found'}, 404)
 
@@ -291,7 +367,9 @@ class APIRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_poll_computer(self, computer_id):
         try:
+            cmd_logger.info(f"COMMAND SENT: Explorer -> Server | POLL_COMPUTER | computer_id={computer_id}")
             self.db_manager.set_poll_requested(int(computer_id))
+            cmd_logger.info(f"COMMAND STATUS: Server set poll_requested=1 for computer_id={computer_id}")
             self._send_json({'success': True, 'message': 'Poll requested'})
         except Exception as e:
             logger.error(f"API error requesting poll: {e}")
@@ -299,7 +377,9 @@ class APIRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_poll_all(self):
         try:
+            cmd_logger.info(f"COMMAND SENT: Explorer -> Server | POLL_ALL_COMPUTERS")
             self.db_manager.set_poll_requested_all()
+            cmd_logger.info(f"COMMAND STATUS: Server set poll_requested=1 for ALL computers")
             self._send_json({'success': True, 'message': 'Poll requested for all computers'})
         except Exception as e:
             logger.error(f"API error requesting poll all: {e}")
@@ -397,6 +477,34 @@ class APIRequestHandler(BaseHTTPRequestHandler):
             logger.error(f"API error deleting computer: {e}")
             self._send_json({'error': str(e)}, 500)
 
+    def _handle_explorer_register(self, parsed):
+        """Register explorer callback URL for push notifications"""
+        query = parse_qs(parsed.query)
+        callback_url = query.get('callback', [None])[0]
+        if not callback_url:
+            self._send_json({'error': 'callback parameter required'}, 400)
+            return
+        try:
+            self.notifier.register(callback_url)
+            self._send_json({'success': True, 'message': 'Explorer registered'})
+        except Exception as e:
+            logger.error(f"API error registering explorer: {e}")
+            self._send_json({'error': str(e)}, 500)
+
+    def _handle_explorer_unregister(self, parsed):
+        """Unregister explorer callback URL"""
+        query = parse_qs(parsed.query)
+        callback_url = query.get('callback', [None])[0]
+        if not callback_url:
+            self._send_json({'error': 'callback parameter required'}, 400)
+            return
+        try:
+            self.notifier.unregister(callback_url)
+            self._send_json({'success': True, 'message': 'Explorer unregistered'})
+        except Exception as e:
+            logger.error(f"API error unregistering explorer: {e}")
+            self._send_json({'error': str(e)}, 500)
+
     def _send_json(self, data, status=200):
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
@@ -409,9 +517,10 @@ class APIRequestHandler(BaseHTTPRequestHandler):
 
 
 class APIServer:
-    def __init__(self, port: int, db_manager: DatabaseManager):
+    def __init__(self, port: int, db_manager: DatabaseManager, notifier: ExplorerNotifier):
         self.port = port
         self.db_manager = db_manager
+        self.notifier = notifier
         self.server = None
         self.thread = None
         self.running = False
@@ -420,7 +529,7 @@ class APIServer:
         if self.running:
             return
         self.running = True
-        handler = lambda *args, **kwargs: APIRequestHandler(*args, db_manager=self.db_manager, **kwargs)
+        handler = lambda *args, **kwargs: APIRequestHandler(*args, db_manager=self.db_manager, notifier=self.notifier, **kwargs)
         self.server = HTTPServer(('0.0.0.0', self.port), handler)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -486,9 +595,10 @@ class ConfigManager:
 
 
 class NetworkListener:
-    def __init__(self, port: int, db_manager: DatabaseManager):
+    def __init__(self, port: int, db_manager: DatabaseManager, notifier: ExplorerNotifier):
         self.port = port
         self.db_manager = db_manager
+        self.notifier = notifier
         self.server_socket = None
         self.running = False
         self.thread = None
@@ -562,7 +672,10 @@ class NetworkListener:
                 commands = []
                 if self.db_manager.get_poll_requested(ip_address):
                     commands.append("POLL_NOW")
+                    cmd_logger.info(f"COMMAND SENT: Server -> Client ({ip_address}) | POLL_NOW | via command_check")
                     self.db_manager.clear_poll_requested(ip_address)
+                else:
+                    cmd_logger.debug(f"COMMAND CHECK: Server -> Client ({ip_address}) | No poll requested")
                 return json.dumps({"status": "OK", "commands": commands})
             
             required_fields = ['hostname', 'devices']
@@ -589,10 +702,14 @@ class NetworkListener:
                 self.db_manager.save_devices(computer_id, devices)
             logger.info(f"Received inventory from {computer_data['hostname']} ({ip_address})")
             
+            # Notify all explorers that data was updated
+            self.notifier.notify_all()
+            
             # Check if poll was requested
             commands = []
             if self.db_manager.get_poll_requested(ip_address):
                 commands.append("POLL_NOW")
+                cmd_logger.info(f"COMMAND SENT: Server -> Client ({ip_address}) | POLL_NOW | via inventory response")
                 self.db_manager.clear_poll_requested(ip_address)
             
             return json.dumps({"status": "OK", "commands": commands})
@@ -668,10 +785,22 @@ class SettingsWindow:
                 raise ValueError("API port out of range")
             if port == api_port:
                 raise ValueError("Ports must be different")
+            
+            # Get current ports to compare
+            current_port = self.config_manager.get_port()
+            current_api_port = self.config_manager.get_api_port()
+            
+            port_changed = port != current_port
+            api_port_changed = api_port != current_api_port
+            
             self.config_manager.set_port(port)
             self.config_manager.set_api_port(api_port)
-            self.on_port_change(port)
-            self.on_api_port_change(api_port)
+            
+            if port_changed:
+                self.on_port_change(port)
+            if api_port_changed:
+                self.on_api_port_change(api_port)
+            
             self.window.destroy()
         except ValueError as e:
             messagebox.showerror("Ошибка", str(e))
@@ -692,8 +821,9 @@ class InventoryServer:
     def __init__(self):
         self.config_manager = ConfigManager(CONFIG_FILE)
         self.db_manager = DatabaseManager(DB_FILE)
-        self.listener = NetworkListener(self.config_manager.get_port(), self.db_manager)
-        self.api_server = APIServer(self.config_manager.get_api_port(), self.db_manager)
+        self.notifier = ExplorerNotifier()
+        self.listener = NetworkListener(self.config_manager.get_port(), self.db_manager, self.notifier)
+        self.api_server = APIServer(self.config_manager.get_api_port(), self.db_manager, self.notifier)
         self.tray_icon = None
         self.root = tk.Tk()
         self.root.withdraw()
@@ -721,12 +851,12 @@ class InventoryServer:
     def _show_settings(self, icon=None, item=None):
         def on_port_change(new_port):
             self.listener.stop()
-            self.listener = NetworkListener(new_port, self.db_manager)
+            self.listener = NetworkListener(new_port, self.db_manager, self.notifier)
             self.listener.start()
 
         def on_api_port_change(new_api_port):
             self.api_server.stop()
-            self.api_server = APIServer(new_api_port, self.db_manager)
+            self.api_server = APIServer(new_api_port, self.db_manager, self.notifier)
             self.api_server.start()
 
         # Schedule in main thread to avoid threading issues with Tkinter

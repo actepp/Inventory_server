@@ -6,19 +6,42 @@ import time
 import queue
 import urllib.request
 import urllib.error
-import xml.etree.ElementTree as ET
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import tkinter as tk
 from tkinter import ttk, messagebox, font
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Setup logging with file handler for command tracing
+def setup_logger(name, log_file):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    
+    # Clear existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_format)
+    logger.addHandler(console_handler)
+    
+    # File handler for command tracing
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_format)
+    logger.addHandler(file_handler)
+    
+    return logger
 
+base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+logger = setup_logger('InventoryExplorer', base_dir / "Inventory_explorer.log")
+cmd_logger = setup_logger('InventoryExplorer.Commands', base_dir / "Inventory_explorer.log")
 
 def get_os_display_name(os_name: str, os_version: str) -> str:
     """Get proper OS display name (e.g., Windows 11 vs Windows 10)"""
@@ -37,6 +60,87 @@ def get_base_dir():
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent
     return Path(__file__).parent
+
+
+class PushNotificationHandler(BaseHTTPRequestHandler):
+    """Handle push notifications from server"""
+    def __init__(self, *args, explorer=None, **kwargs):
+        self.explorer = explorer
+        super().__init__(*args, **kwargs)
+
+    def do_POST(self):
+        if self.path == '/push':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                if data.get('type') == 'data_updated':
+                    logger.info("Received push notification: data_updated")
+                    if self.explorer:
+                        self.explorer._msg_queue.put(('push_update', None))
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok"}')
+            except Exception as e:
+                logger.error(f"Error handling push notification: {e}")
+                self.send_response(400)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        # Suppress default log messages
+        pass
+
+
+class PushNotificationServer:
+    """Simple HTTP server to receive push notifications from inventory server"""
+    def __init__(self, explorer):
+        self.explorer = explorer
+        self.server = None
+        self.thread = None
+        self.port = None
+        self.callback_url = None
+
+    def start(self):
+        """Start the server on a random available port"""
+        # Find an available port
+        for port in range(50100, 50200):
+            try:
+                handler = lambda *args, **kwargs: PushNotificationHandler(*args, explorer=self.explorer, **kwargs)
+                self.server = HTTPServer(('127.0.0.1', port), handler)
+                self.port = port
+                self.callback_url = f"http://127.0.0.1:{port}/push"
+                break
+            except OSError:
+                continue
+        
+        if not self.server:
+            logger.error("Failed to find available port for push notifications")
+            return False
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        logger.info(f"Push notification server started on port {self.port}")
+        return True
+
+    def _run(self):
+        self.server.serve_forever()
+
+    def stop(self):
+        if self.server:
+            try:
+                self.server.shutdown()
+            except:
+                pass
+        if self.thread:
+            self.thread.join(timeout=2)
+        logger.info("Push notification server stopped")
+
+    def get_callback_url(self):
+        return self.callback_url
 
 
 CONFIG_FILE = get_base_dir() / "explorer_config.json"
@@ -148,10 +252,16 @@ class APIClient:
         return self._make_request('DELETE', f'/api/computers/{computer_id}')
 
     def poll_computer(self, computer_id):
-        return self._make_request('POST', f'/api/computers/{computer_id}/poll')
+        cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_COMPUTER | computer_id={computer_id}")
+        result = self._make_request('POST', f'/api/computers/{computer_id}/poll')
+        cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_COMPUTER | computer_id={computer_id} | result={result}")
+        return result
 
     def poll_all_computers(self):
-        return self._make_request('POST', '/api/computers/poll-all')
+        cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_ALL_COMPUTERS")
+        result = self._make_request('POST', '/api/computers/poll-all')
+        cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_ALL_COMPUTERS | result={result}")
+        return result
 
 
 class InventoryExplorer:
@@ -170,9 +280,14 @@ class InventoryExplorer:
         self._refreshing = False
         self._msg_queue = queue.Queue()
         
+        # Push notification server
+        self.push_server = PushNotificationServer(self)
+        self._push_registered = False
+        
         self._setup_styles()
         self._create_ui()
         self._create_menu()
+        self._start_push_server()
         self._refresh_data()
         self._start_status_checker()
         self._process_queue()
@@ -260,6 +375,42 @@ class InventoryExplorer:
         self.root.config(menu=menubar)
         self.root.bind('<F5>', lambda e: self._refresh_data())
 
+    def _start_push_server(self):
+        """Start push notification server and register with inventory server"""
+        if self.push_server.start():
+            callback_url = self.push_server.get_callback_url()
+            threading.Thread(target=self._register_push_callback, args=(callback_url,), daemon=True).start()
+
+    def _register_push_callback(self, callback_url):
+        """Register callback URL with inventory server"""
+        try:
+            url = f"http://{self.config.get_server_ip()}:{self.config.get_api_port()}/api/explorer/register?callback={urllib.parse.quote(callback_url)}"
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('success'):
+                    self._push_registered = True
+                    cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | REGISTER_PUSH | callback={callback_url}")
+                    logger.info(f"Registered for push notifications: {callback_url}")
+        except Exception as e:
+            logger.warning(f"Failed to register push callback: {e}")
+
+    def _unregister_push_callback(self):
+        """Unregister callback URL from inventory server"""
+        if not self._push_registered:
+            return
+        try:
+            callback_url = self.push_server.get_callback_url()
+            url = f"http://{self.config.get_server_ip()}:{self.config.get_api_port()}/api/explorer/unregister?callback={urllib.parse.quote(callback_url)}"
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                if result.get('success'):
+                    self._push_registered = False
+                    cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | UNREGISTER_PUSH | callback={callback_url}")
+        except Exception as e:
+            logger.warning(f"Failed to unregister push callback: {e}")
+
     def _show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
         if item:
@@ -339,12 +490,12 @@ class InventoryExplorer:
         
         self.status_var.set(f"Найдено ПК: {len(computers)}")
         
-        # Force load all devices and export to XML after a short delay
+        # Force load all devices after a short delay
         if computers:
-            self.root.after(1000, self._force_load_all_and_export)
+            self.root.after(1000, self._force_load_all_devices)
 
-    def _force_load_all_and_export(self):
-        """Force load devices for all computers, then export"""
+    def _force_load_all_devices(self):
+        """Force load devices for all computers"""
         # Find all computer items and load their devices
         for item_id in self.tree.get_children():
             # Check if it has the "Загрузка..." placeholder
@@ -354,88 +505,6 @@ class InventoryExplorer:
                     self.tree.delete(child)
                     self._load_devices(item_id)
                     break
-        
-        # Export after devices are loaded
-        self.root.after(500, self._export_tree_to_xml)
-
-    def _export_tree_to_xml(self):
-        """Export current tree data to XML file for debugging"""
-        try:
-            base_dir = get_base_dir()
-            xml_file = base_dir / "explorer_debug.xml"
-            
-            root = ET.Element("InventoryExplorer")
-            root.set("timestamp", datetime.now().isoformat())
-            root.set("computer_count", str(len(self.computers_data)))
-            
-            computers_elem = ET.SubElement(root, "Computers")
-            
-            for comp_id, comp in self.computers_data.items():
-                comp_elem = ET.SubElement(computers_elem, "Computer")
-                comp_elem.set("id", str(comp_id))
-                comp_elem.set("hostname", comp.get('hostname', 'Unknown'))
-                comp_elem.set("ip", comp.get('ip_address', 'Unknown'))
-                comp_elem.set("os", comp.get('os_name', 'Unknown'))
-                comp_elem.set("cpu", comp.get('cpu_info', 'Unknown'))
-                comp_elem.set("ram_gb", str(comp.get('ram_total_gb', 0)))
-                
-                # Get tree items for this computer
-                tree_items = self.tree.get_children()
-                for tree_item in tree_items:
-                    if self.tree.item(tree_item, 'text').strip() == comp.get('hostname', ''):
-                        self._xml_walk_tree(tree_item, comp_elem, level=0)
-                        break
-            
-            tree = ET.ElementTree(root)
-            ET.indent(tree, space="  ", level=0)
-            tree.write(xml_file, encoding='utf-8', xml_declaration=True)
-            logger.info(f"Exported tree to XML: {xml_file}")
-        except Exception as e:
-            logger.error(f"Failed to export XML: {e}")
-
-    def _xml_walk_tree(self, item_id, parent_elem, level):
-        """Recursively walk tree and add to XML"""
-        if level > 10:  # Prevent infinite recursion
-            return
-            
-        text = self.tree.item(item_id, 'text')
-        values = self.tree.item(item_id, 'values')
-        
-        # Clean text
-        clean_text = text.strip() if text else ''
-        if not clean_text:
-            return
-            
-        value_text = values[0] if values and len(values) > 0 else ''
-        
-        # Create element based on content
-        if clean_text.startswith('🌐') or clean_text.startswith('🔧') or clean_text.startswith('💾') or clean_text.startswith('🎮') or clean_text.startswith('🖥') or clean_text.startswith('📋') or clean_text.startswith('💿') or clean_text.startswith('📦') or clean_text.startswith('🕐') or clean_text.startswith('🔗'):
-            # System info or class header
-            elem = ET.SubElement(parent_elem, "Node")
-            elem.set("text", clean_text)
-            if value_text:
-                elem.set("value", value_text)
-        elif clean_text.startswith('  ') and not clean_text.startswith('    '):
-            # Device name
-            elem = ET.SubElement(parent_elem, "Device")
-            elem.set("name", clean_text.strip())
-            if value_text:
-                elem.set("details", value_text)
-        elif clean_text.startswith('    '):
-            # Detail item
-            elem = ET.SubElement(parent_elem, "Detail")
-            elem.set("key", clean_text.strip())
-            if value_text:
-                elem.set("value", value_text)
-        else:
-            elem = ET.SubElement(parent_elem, "Node")
-            elem.set("text", clean_text)
-            if value_text:
-                elem.set("value", value_text)
-        
-        # Recurse children
-        for child_id in self.tree.get_children(item_id):
-            self._xml_walk_tree(child_id, elem, level + 1)
 
     def _get_expanded_hostnames(self):
         """Get hostnames of expanded computer nodes"""
@@ -689,6 +758,12 @@ class InventoryExplorer:
 
     def _on_config_change(self):
         self.api_client = APIClient(self.config)
+        # Re-register push callback with new server IP/port
+        self._unregister_push_callback()
+        if self.push_server:
+            self.push_server.stop()
+        self.push_server = PushNotificationServer(self)
+        self._start_push_server()
         self._refresh_data()
         # Status checker will pick up new interval on next iteration
 
@@ -700,6 +775,9 @@ class InventoryExplorer:
 
     def _on_close(self):
         self._status_check_running = False
+        self._unregister_push_callback()
+        if self.push_server:
+            self.push_server.stop()
         self.root.destroy()
 
     def run(self):
@@ -747,10 +825,18 @@ class InventoryExplorer:
                 elif msg_type == 'refresh_done':
                     self._refreshing = False
                     self.status_var.set(f"Найдено ПК: {len(self.computers_data)}")
+                elif msg_type == 'push_update':
+                    self._handle_push_update()
         except queue.Empty:
             pass
         finally:
             self.root.after(100, self._process_queue)
+
+    def _handle_push_update(self):
+        """Handle push notification from server - immediately refresh data"""
+        logger.info("Push notification received, refreshing data immediately")
+        self.status_var.set("Получено обновление от сервера...")
+        self._refresh_data()
 
     def _handle_server_online(self, online_data):
         self._set_server_online(online_data)
@@ -855,8 +941,19 @@ class SettingsWindow:
             if check_interval < 5:
                 raise ValueError("Интервал опроса не может быть меньше 5 секунд")
             
+            # Check if anything actually changed
+            ip_changed = server_ip != self.config.get_server_ip()
+            port_changed = server_port != self.config.get_server_port()
+            api_port_changed = api_port != self.config.get_api_port()
+            interval_changed = check_interval != self.config.get_check_interval()
+            
+            something_changed = ip_changed or port_changed or api_port_changed or interval_changed
+            
             self.config.set_config(server_ip, server_port, api_port, check_interval)
-            self.on_save_callback()
+            
+            if something_changed:
+                self.on_save_callback()
+            
             self.window.destroy()
         except ValueError as e:
             messagebox.showerror("Ошибка", str(e))
