@@ -6,6 +6,7 @@ import time
 import queue
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 
@@ -337,6 +338,104 @@ class InventoryExplorer:
             self._load_devices(item_id)
         
         self.status_var.set(f"Найдено ПК: {len(computers)}")
+        
+        # Force load all devices and export to XML after a short delay
+        if computers:
+            self.root.after(1000, self._force_load_all_and_export)
+
+    def _force_load_all_and_export(self):
+        """Force load devices for all computers, then export"""
+        # Find all computer items and load their devices
+        for item_id in self.tree.get_children():
+            # Check if it has the "Загрузка..." placeholder
+            children = self.tree.get_children(item_id)
+            for child in children:
+                if self.tree.item(child, 'text') == 'Загрузка...':
+                    self.tree.delete(child)
+                    self._load_devices(item_id)
+                    break
+        
+        # Export after devices are loaded
+        self.root.after(500, self._export_tree_to_xml)
+
+    def _export_tree_to_xml(self):
+        """Export current tree data to XML file for debugging"""
+        try:
+            base_dir = get_base_dir()
+            xml_file = base_dir / "explorer_debug.xml"
+            
+            root = ET.Element("InventoryExplorer")
+            root.set("timestamp", datetime.now().isoformat())
+            root.set("computer_count", str(len(self.computers_data)))
+            
+            computers_elem = ET.SubElement(root, "Computers")
+            
+            for comp_id, comp in self.computers_data.items():
+                comp_elem = ET.SubElement(computers_elem, "Computer")
+                comp_elem.set("id", str(comp_id))
+                comp_elem.set("hostname", comp.get('hostname', 'Unknown'))
+                comp_elem.set("ip", comp.get('ip_address', 'Unknown'))
+                comp_elem.set("os", comp.get('os_name', 'Unknown'))
+                comp_elem.set("cpu", comp.get('cpu_info', 'Unknown'))
+                comp_elem.set("ram_gb", str(comp.get('ram_total_gb', 0)))
+                
+                # Get tree items for this computer
+                tree_items = self.tree.get_children()
+                for tree_item in tree_items:
+                    if self.tree.item(tree_item, 'text').strip() == comp.get('hostname', ''):
+                        self._xml_walk_tree(tree_item, comp_elem, level=0)
+                        break
+            
+            tree = ET.ElementTree(root)
+            ET.indent(tree, space="  ", level=0)
+            tree.write(xml_file, encoding='utf-8', xml_declaration=True)
+            logger.info(f"Exported tree to XML: {xml_file}")
+        except Exception as e:
+            logger.error(f"Failed to export XML: {e}")
+
+    def _xml_walk_tree(self, item_id, parent_elem, level):
+        """Recursively walk tree and add to XML"""
+        if level > 10:  # Prevent infinite recursion
+            return
+            
+        text = self.tree.item(item_id, 'text')
+        values = self.tree.item(item_id, 'values')
+        
+        # Clean text
+        clean_text = text.strip() if text else ''
+        if not clean_text:
+            return
+            
+        value_text = values[0] if values and len(values) > 0 else ''
+        
+        # Create element based on content
+        if clean_text.startswith('🌐') or clean_text.startswith('🔧') or clean_text.startswith('💾') or clean_text.startswith('🎮') or clean_text.startswith('🖥') or clean_text.startswith('📋') or clean_text.startswith('💿') or clean_text.startswith('📦') or clean_text.startswith('🕐') or clean_text.startswith('🔗'):
+            # System info or class header
+            elem = ET.SubElement(parent_elem, "Node")
+            elem.set("text", clean_text)
+            if value_text:
+                elem.set("value", value_text)
+        elif clean_text.startswith('  ') and not clean_text.startswith('    '):
+            # Device name
+            elem = ET.SubElement(parent_elem, "Device")
+            elem.set("name", clean_text.strip())
+            if value_text:
+                elem.set("details", value_text)
+        elif clean_text.startswith('    '):
+            # Detail item
+            elem = ET.SubElement(parent_elem, "Detail")
+            elem.set("key", clean_text.strip())
+            if value_text:
+                elem.set("value", value_text)
+        else:
+            elem = ET.SubElement(parent_elem, "Node")
+            elem.set("text", clean_text)
+            if value_text:
+                elem.set("value", value_text)
+        
+        # Recurse children
+        for child_id in self.tree.get_children(item_id):
+            self._xml_walk_tree(child_id, elem, level + 1)
 
     def _get_expanded_hostnames(self):
         """Get hostnames of expanded computer nodes"""
@@ -381,10 +480,6 @@ class InventoryExplorer:
             except:
                 pass
         self.tree.insert(parent_item, 'end', text='🕐 Последний раз', values=(last_seen or 'Unknown',))
-        
-        # MAC Address
-        mac = comp.get('mac_address', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🔗 MAC адрес', values=(mac,))
 
     def _on_tree_open(self, event):
         item = self.tree.focus()
@@ -467,20 +562,45 @@ class InventoryExplorer:
                 status = dev.get('status', '')
                 device_id = dev.get('device_id', '')
                 
-                # Build info string
-                info_parts = []
-                if manufacturer and manufacturer != 'Unknown':
-                    info_parts.append(f'Производитель: {manufacturer}')
-                if driver_version and driver_version != 'Unknown' and driver_version != 'N/A':
-                    info_parts.append(f'Драйвер: {driver_version}')
-                if device_id and device_id != 'Unknown':
-                    info_parts.append(f'ID: {device_id}')
+                # For NetworkAdapter, skip if no driver_version or no detailed info (no IP config = not expandable)
+                if cls == 'NetworkAdapter':
+                    if not driver_version or driver_version == 'Unknown' or driver_version == 'N/A':
+                        continue
+                    # Check if driver_version contains actual network details (MAC, IP, Speed, etc.)
+                    # Skip if it only has basic info without expandable details
+                    detailed_keywords = ['MAC:', 'IP:', 'Скорость:', 'Маска:', 'Шлюз:', 'DNS:', 'DHCP:']
+                    if not any(kw in driver_version for kw in detailed_keywords):
+                        continue
                 
-                info_text = ' | '.join(info_parts) if info_parts else ''
-                
-                self.tree.insert(class_item, 'end', 
-                    text=f'  {name}',
-                    values=(info_text,))
+                # For NetworkAdapter, don't show details in parent row
+                if cls == 'NetworkAdapter':
+                    info_parts = []
+                    if manufacturer and manufacturer != 'Unknown':
+                        info_parts.append(f'Производитель: {manufacturer}')
+                    info_text = ' | '.join(info_parts) if info_parts else ''
+                    
+                    device_item = self.tree.insert(class_item, 'end', 
+                        text=f'  {name}',
+                        values=(info_text,))
+                    
+                    # Create sub-items with all details (IP, DNS, DHCP, etc.)
+                    if driver_version:
+                        self._add_network_adapter_details(device_item, driver_version)
+                else:
+                    # Build info string for other device types
+                    info_parts = []
+                    if manufacturer and manufacturer != 'Unknown':
+                        info_parts.append(f'Производитель: {manufacturer}')
+                    if driver_version and driver_version != 'Unknown' and driver_version != 'N/A':
+                        info_parts.append(f'Драйвер: {driver_version}')
+                    if device_id and device_id != 'Unknown':
+                        info_parts.append(f'ID: {device_id}')
+                    
+                    info_text = ' | '.join(info_parts) if info_parts else ''
+                    
+                    self.tree.insert(class_item, 'end', 
+                        text=f'  {name}',
+                        values=(info_text,))
 
     def _on_select(self, event):
         item = self.tree.focus()
@@ -489,6 +609,18 @@ class InventoryExplorer:
             parent = self.tree.parent(item)
             if not parent:
                 self.selected_computer_id = self._get_computer_id_from_item(item)
+
+    def _add_network_adapter_details(self, parent_item, details_str):
+        """Parse network adapter details and create sub-items"""
+        # Expected format: "Скорость: 1 Gbps | IP: 192.168.1.100 | Маска: 255.255.255.0 | Шлюз: 192.168.1.1 | DNS: 8.8.8.8 | DHCP: Да | DHCP сервер: 192.168.1.1"
+        parts = [p.strip() for p in details_str.split('|')]
+        for part in parts:
+            if ':' in part:
+                key, value = part.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                if value and value != 'N/A':
+                    self.tree.insert(parent_item, 'end', text=f'    {key}', values=(value,))
 
     def _get_computer_id_from_item(self, item):
         hostname = self.tree.item(item, 'text').strip()
@@ -577,11 +709,16 @@ class InventoryExplorer:
     def _start_status_checker(self):
         """Start background thread to periodically check server status"""
         def status_checker():
+            first_check = True
             while self._status_check_running:
-                interval = self.config.get_check_interval()
-                if interval < 5:
-                    interval = 5  # minimum 5 seconds
-                time.sleep(interval)
+                if not first_check:
+                    interval = self.config.get_check_interval()
+                    if interval < 5:
+                        interval = 5  # minimum 5 seconds
+                    time.sleep(interval)
+                else:
+                    first_check = False
+                
                 if not self._status_check_running:
                     break
                 if self._refreshing:

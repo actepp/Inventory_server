@@ -473,40 +473,111 @@ class SystemInfoCollector:
         return devices
 
     def _get_network_adapters(self):
-        """Get network adapters with link speed"""
+        """Get network adapters with detailed configuration"""
         devices = []
         try:
             wmi_conn = self._get_wmi_conn()
             if wmi_conn:
+                # Get adapter configurations (IP, DNS, DHCP, etc.) - keyed by normalized MAC
+                adapter_configs = {}
+                for nac in wmi_conn.Win32_NetworkAdapterConfiguration():
+                    if nac.IPEnabled and nac.MACAddress:
+                        mac = nac.MACAddress.strip().lower().replace(':', '').replace('-', '')
+                        ip_list = nac.IPAddress if nac.IPAddress else []
+                        ip_str = ', '.join(ip_list) if ip_list else 'N/A'
+                        subnet_list = nac.IPSubnet if nac.IPSubnet else []
+                        subnet_str = ', '.join(subnet_list) if subnet_list else 'N/A'
+                        gateway_list = nac.DefaultIPGateway if nac.DefaultIPGateway else []
+                        gateway_str = ', '.join(gateway_list) if gateway_list else 'N/A'
+                        dns_list = nac.DNSServerSearchOrder if nac.DNSServerSearchOrder else []
+                        dns_str = ', '.join(dns_list) if dns_list else 'N/A'
+                        dhcp_enabled = 'Да' if nac.DHCPEnabled else 'Нет'
+                        dhcp_server = nac.DHCPServer if nac.DHCPServer else 'N/A'
+                        
+                        adapter_configs[mac] = {
+                            'ip': ip_str,
+                            'subnet': subnet_str,
+                            'gateway': gateway_str,
+                            'dns': dns_str,
+                            'dhcp_enabled': dhcp_enabled,
+                            'dhcp_server': dhcp_server,
+                        }
+                
+                # Get physical adapters with speed - build lookup by normalized MAC
+                adapter_speeds = {}
+                adapter_names = {}
+                adapter_manufacturers = {}
                 for na in wmi_conn.Win32_NetworkAdapter():
-                    if na.NetConnectionStatus == 2 and na.Speed:  # Connected and has speed
-                        name = na.Name.strip() if na.Name else "Unknown"
+                    if na.MACAddress:
+                        mac = na.MACAddress.strip().lower().replace(':', '').replace('-', '')
                         speed = na.Speed
-                        # Speed can be string or int
                         try:
                             speed = int(speed)
                         except (ValueError, TypeError):
                             speed = 0
                         
-                        # Format speed
                         if speed >= 1000000000:
-                            speed_str = f'{speed // 1000000000} Gbps'
+                            current_speed_str = f'{speed // 1000000000} Gbps'
                         elif speed >= 1000000:
-                            speed_str = f'{speed // 1000000} Mbps'
+                            current_speed_str = f'{speed // 1000000} Mbps'
                         else:
-                            speed_str = f'{speed} bps'
+                            current_speed_str = f'{speed} bps' if speed > 0 else 'N/A'
                         
-                        mac = na.MACAddress.strip() if na.MACAddress else "Unknown"
-                        manufacturer = na.Manufacturer.strip() if na.Manufacturer else "Unknown"
-                        
-                        devices.append({
-                            'class': 'NetworkAdapter',
-                            'name': name,
-                            'device_id': mac,
-                            'manufacturer': manufacturer,
-                            'driver_version': f'Speed: {speed_str}',
-                            'status': 'OK'
-                        })
+                        adapter_speeds[mac] = current_speed_str
+                        adapter_names[mac] = na.Name.strip() if na.Name else "Unknown"
+                        adapter_manufacturers[mac] = na.Manufacturer.strip() if na.Manufacturer else "Unknown"
+                
+                # Combine: for each adapter with IP config, add device
+                for mac, config in adapter_configs.items():
+                    name = adapter_names.get(mac, "Unknown")
+                    manufacturer = adapter_manufacturers.get(mac, "Unknown")
+                    speed_str = adapter_speeds.get(mac, 'N/A')
+                    
+                    # Skip virtual adapters by name patterns
+                    name_lower = name.lower()
+                    virtual_keywords = [
+                        'loopback', 'vpn', 'tap', 'tun', 'virtual', 'hyper-v', 
+                        'docker', 'vmware', 'virtualbox', 'pseudo', 'openvpn',
+                        'wireguard', 'zerotier', 'tailscale', 'hamachi'
+                    ]
+                    if any(kw in name_lower for kw in virtual_keywords):
+                        continue
+                    
+                    # Skip if no real physical speed (N/A or 0)
+                    if speed_str == 'N/A' or speed_str == '0 bps':
+                        continue
+                    
+                    # Format MAC for display
+                    mac_display = ':'.join([mac[i:i+2] for i in range(0, 12, 2)]) if len(mac) == 12 else mac
+                    
+                    details = []
+                    details.append(f'MAC: {mac_display}')
+                    details.append(f'Скорость: {speed_str}')
+                    if config.get('ip') != 'N/A':
+                        details.append(f'IP: {config["ip"]}')
+                    if config.get('subnet') != 'N/A':
+                        details.append(f'Маска: {config["subnet"]}')
+                    if config.get('gateway') != 'N/A':
+                        details.append(f'Шлюз: {config["gateway"]}')
+                    if config.get('dns') != 'N/A':
+                        details.append(f'DNS: {config["dns"]}')
+                    details.append(f'DHCP: {config.get("dhcp_enabled", "N/A")}')
+                    if config.get('dhcp_server') != 'N/A':
+                        details.append(f'DHCP сервер: {config["dhcp_server"]}')
+                    
+                    # Only include adapters with at least one meaningful detail beyond MAC and speed=N/A
+                    meaningful_details = [d for d in details if not d.startswith('MAC:') and not (d.startswith('Скорость:') and d.endswith('N/A'))]
+                    if not meaningful_details:
+                        continue  # Skip adapters with no useful info
+                    
+                    devices.append({
+                        'class': 'NetworkAdapter',
+                        'name': name,
+                        'device_id': mac_display,
+                        'manufacturer': manufacturer,
+                        'driver_version': ' | '.join(details),
+                        'status': 'OK'
+                    })
         except Exception as e:
             logger.warning(f"Network adapter collection failed: {e}")
         return devices
@@ -518,6 +589,28 @@ class SystemInfoCollector:
             if wmi_conn:
                 for device in wmi_conn.Win32_PnPEntity():
                     if device.DeviceID and device.Name:
+                        # Skip network adapters - handled separately in _get_network_adapters()
+                        class_guid = (device.ClassGuid or "").upper()
+                        device_class = (device.Class or "").upper()
+                        name_lower = (device.Name or "").lower()
+                        # Network adapter ClassGuid: {4D36E972-E325-11CE-BFC1-08002BE10318}
+                        # Network adapter Class: "NET"
+                        net_guid = "{4D36E972-E325-11CE-BFC1-08002BE10318}"
+                        # Broad filter: skip if ClassGuid matches, Class is NET, or name contains network terms
+                        is_network_adapter = (
+                            class_guid == net_guid or 
+                            device_class == "NET" or 
+                            net_guid in class_guid or
+                            any(kw in name_lower for kw in [
+                                'ethernet', 'wi-fi', 'wifi', 'wireless', 'bluetooth', 'wan miniport', 
+                                'vpn', 'tap', 'tun', 'virtual', 'loopback', 'pseudo', 'openvpn', 
+                                'wireguard', 'zerotier', 'tailscale', 'hamachi',
+                                'подключение', 'сетевой', 'адаптер', 'сеть',
+                                'connection', 'adapter', 'network', 'nic'
+                            ])
+                        )
+                        if is_network_adapter:
+                            continue
                         devices.append({
                             'class': device.ClassGuid or "Unknown",
                             'name': device.Name.strip(),
