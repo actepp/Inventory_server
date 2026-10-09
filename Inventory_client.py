@@ -533,20 +533,6 @@ class SystemInfoCollector:
                     manufacturer = adapter_manufacturers.get(mac, "Unknown")
                     speed_str = adapter_speeds.get(mac, 'N/A')
                     
-                    # Skip virtual adapters by name patterns
-                    name_lower = name.lower()
-                    virtual_keywords = [
-                        'loopback', 'vpn', 'tap', 'tun', 'virtual', 'hyper-v', 
-                        'docker', 'vmware', 'virtualbox', 'pseudo', 'openvpn',
-                        'wireguard', 'zerotier', 'tailscale', 'hamachi'
-                    ]
-                    if any(kw in name_lower for kw in virtual_keywords):
-                        continue
-                    
-                    # Skip if no real physical speed (N/A or 0)
-                    if speed_str == 'N/A' or speed_str == '0 bps':
-                        continue
-                    
                     # Format MAC for display
                     mac_display = ':'.join([mac[i:i+2] for i in range(0, 12, 2)]) if len(mac) == 12 else mac
                     
@@ -565,8 +551,25 @@ class SystemInfoCollector:
                     if config.get('dhcp_server') != 'N/A':
                         details.append(f'DHCP сервер: {config["dhcp_server"]}')
                     
-                    # Only include adapters with at least one meaningful detail beyond MAC and speed=N/A
+                    # Check if adapter has meaningful network details (beyond just MAC and speed)
                     meaningful_details = [d for d in details if not d.startswith('MAC:') and not (d.startswith('Скорость:') and d.endswith('N/A'))]
+                    has_ip_config = config.get('ip') != 'N/A' or config.get('subnet') != 'N/A'
+                    
+                    # Skip virtual adapters by name patterns ONLY if they lack meaningful IP config
+                    name_lower = name.lower()
+                    virtual_keywords = [
+                        'loopback', 'vpn', 'tap', 'tun', 'virtual', 'hyper-v', 
+                        'docker', 'vmware', 'virtualbox', 'pseudo', 'openvpn',
+                        'wireguard', 'zerotier', 'tailscale', 'hamachi'
+                    ]
+                    is_virtual = any(kw in name_lower for kw in virtual_keywords)
+                    if is_virtual and not has_ip_config:
+                        continue  # Skip virtual adapters without real IP config
+                    
+                    # Skip if no real physical speed AND no IP config (completely useless)
+                    if speed_str == 'N/A' and not has_ip_config:
+                        continue
+                    
                     if not meaningful_details:
                         continue  # Skip adapters with no useful info
                     
