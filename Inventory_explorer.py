@@ -435,7 +435,7 @@ class InventoryExplorer:
                 classes[cls] = []
             classes[cls].append(dev)
         
-        # Class icons mapping
+        # Class icons and Russian names mapping
         class_icons = {
             'Processor': '🔧',
             'Memory': '💾',
@@ -446,9 +446,20 @@ class InventoryExplorer:
             'NetworkAdapter': '🌐',
         }
         
+        class_names_ru = {
+            'Processor': 'Процессор',
+            'Memory': 'Оперативная память',
+            'DisplayAdapter': 'Видеокарты',
+            'Monitor': 'Мониторы',
+            'Motherboard': 'Материнская плата',
+            'DiskDrive': 'Локальные диски',
+            'NetworkAdapter': 'Сетевые адаптеры',
+        }
+        
         for cls, devs in sorted(classes.items()):
             icon = class_icons.get(cls, '📦')
-            class_item = self.tree.insert(computer_item, 'end', text=f'{icon} {cls}', values=(''))
+            display_name = class_names_ru.get(cls, cls)
+            class_item = self.tree.insert(computer_item, 'end', text=f'{icon} {display_name}', values=(''))
             for dev in devs:
                 name = dev.get('device_name', 'Unknown')
                 manufacturer = dev.get('manufacturer', '')
