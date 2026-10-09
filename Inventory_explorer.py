@@ -7,6 +7,8 @@ import queue
 import urllib.request
 import urllib.error
 import urllib.parse
+import ssl
+import certifi
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -154,6 +156,7 @@ EXPLORER_VERSION = "1.0.0"
 # GitHub repository for updates (change to your repo)
 GITHUB_REPO = "actepp/Inventory_server"  # Формат: "username/repository"
 GITHUB_VERSION_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/version.txt"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
 class ExplorerConfig:
@@ -285,6 +288,10 @@ class InventoryExplorer:
         self._refreshing = False
         self._msg_queue = queue.Queue()
         
+        # Client version update tracking
+        self._latest_client_version = None
+        self._version_check_running = True
+        
         # Push notification server
         self.push_server = PushNotificationServer(self)
         self._push_registered = False
@@ -295,6 +302,7 @@ class InventoryExplorer:
         self._start_push_server()
         self._refresh_data()
         self._start_status_checker()
+        self._start_version_checker()  # Check on startup + every 10 min
         self._process_queue()
         
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -352,6 +360,10 @@ class InventoryExplorer:
         
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
+        
+        # Tag for outdated client version (after tree is created)
+        self.tree.tag_configure('outdated', foreground='#e67e00')  # Orange
+        self.tree.tag_configure('current', foreground='black')
 
         self.tree.bind('<<TreeviewOpen>>', self._on_tree_open)
         self.tree.bind('<<TreeviewSelect>>', self._on_select)
@@ -535,7 +547,19 @@ class InventoryExplorer:
         """Add system info as child nodes under computer"""
         # Client version
         client_version = comp.get('client_version', '?')
-        self.tree.insert(parent_item, 'end', text='📦 Версия агент-клиента', values=(client_version,))
+        version_item = self.tree.insert(parent_item, 'end', text='📦 Версия агент-клиента', values=(client_version,))
+        
+        # Apply orange tag if outdated
+        if self._latest_client_version and client_version != '?':
+            try:
+                current_ver = version.parse(client_version)
+                latest_ver = version.parse(self._latest_client_version)
+                if current_ver < latest_ver:
+                    self.tree.item(version_item, tags=('outdated',))
+                else:
+                    self.tree.item(version_item, tags=('current',))
+            except Exception:
+                pass
         
         # IP Address
         ip = comp.get('ip_address', 'Unknown')
@@ -799,6 +823,9 @@ class InventoryExplorer:
                 self.root.after(0, lambda: self._show_update_result("Не удалось получить информацию о версии"))
                 return
             
+            # Store latest version for tree highlighting
+            self._latest_client_version = latest_version
+            
             # Compare versions
             try:
                 current_ver = version.parse(current_version)
@@ -813,34 +840,87 @@ class InventoryExplorer:
             else:
                 self.root.after(0, lambda: self._show_update_result("Обновлений нет"))
                 
+            # Refresh tree to apply orange highlighting
+            self.root.after(0, self._refresh_data)
+                
         except Exception as e:
             logger.error(f"Failed to check client update: {e}")
             self.root.after(0, lambda: self._show_update_result(f"Ошибка проверки: {e}"))
 
     def _fetch_latest_client_version(self):
-        """Fetch latest client version from GitHub releases version.txt"""
+        """Fetch latest client version from GitHub releases"""
         try:
-            req = urllib.request.Request(GITHUB_VERSION_URL, headers={'User-Agent': 'InventoryExplorer'})
+            # First try GitHub API to get latest release assets
+            logger.info(f"Fetching release info from {GITHUB_API_URL}")
+            req = urllib.request.Request(GITHUB_API_URL, headers={'User-Agent': 'InventoryExplorer'})
             with urllib.request.urlopen(req, timeout=10) as response:
-                content = response.read().decode('utf-8').strip()
+                logger.info(f"API Response status: {response.status}")
+                release_data = json.loads(response.read().decode('utf-8'))
             
-            # Parse version.txt format:
-            # server 1.0.1
-            # client 1.0.1
-            # explorer 1.0.1
+            # Find version.txt asset
+            assets = release_data.get('assets', [])
+            version_asset = None
+            for asset in assets:
+                if asset.get('name') == 'version.txt':
+                    version_asset = asset
+                    break
+            
+            if not version_asset:
+                logger.warning("version.txt not found in release assets")
+                # Fallback: try direct download URL
+                return self._fetch_version_txt_direct()
+            
+            # Download version.txt from asset URL
+            download_url = version_asset.get('browser_download_url')
+            if not download_url:
+                logger.warning("No download URL for version.txt")
+                return self._fetch_version_txt_direct()
+            
+            logger.info(f"Downloading version.txt from {download_url}")
+            req = urllib.request.Request(download_url, headers={'User-Agent': 'InventoryExplorer'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                logger.info(f"Download response status: {response.status}")
+                content = response.read().decode('utf-8').strip()
+                logger.info(f"Response content: {content[:200]}")
+            
+            # Parse version.txt format
             for line in content.splitlines():
                 line = line.strip()
                 if line.startswith('client '):
-                    return line.split(' ', 1)[1].strip()
+                    version = line.split(' ', 1)[1].strip()
+                    logger.info(f"Parsed client version: {version}")
+                    return version
+            logger.warning("No 'client ' line found in version.txt")
             return None
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                logger.warning("version.txt not found in GitHub releases")
+                logger.warning("Release or version.txt not found")
             else:
-                logger.error(f"HTTP error fetching version.txt: {e}")
+                logger.error(f"HTTP error: {e}")
             return None
         except Exception as e:
-            logger.error(f"Failed to fetch version.txt: {e}")
+            logger.error(f"Failed to fetch version: {type(e).__name__}: {e}")
+            return None
+
+    def _fetch_version_txt_direct(self):
+        """Fallback: try direct download URL"""
+        try:
+            logger.info(f"Fallback: fetching from {GITHUB_VERSION_URL}")
+            req = urllib.request.Request(GITHUB_VERSION_URL, headers={'User-Agent': 'InventoryExplorer'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                logger.info(f"Fallback response status: {response.status}")
+                content = response.read().decode('utf-8').strip()
+                logger.info(f"Fallback content: {content[:200]}")
+            
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith('client '):
+                    version = line.split(' ', 1)[1].strip()
+                    logger.info(f"Fallback parsed client version: {version}")
+                    return version
+            return None
+        except Exception as e:
+            logger.error(f"Fallback failed: {type(e).__name__}: {e}")
             return None
 
     def _prompt_update(self, comp_id, current_version, latest_version, version_item):
@@ -896,6 +976,7 @@ class InventoryExplorer:
 
     def _on_close(self):
         self._status_check_running = False
+        self._version_check_running = False
         self._unregister_push_callback()
         if self.push_server:
             self.push_server.stop()
@@ -929,6 +1010,35 @@ class InventoryExplorer:
                     self._msg_queue.put(('server_offline', None))
         
         threading.Thread(target=status_checker, daemon=True).start()
+
+    def _start_version_checker(self):
+        """Start background thread to periodically check client version (every 10 min)"""
+        def version_checker():
+            logger.info("Version checker thread started")
+            first_check = True
+            while self._version_check_running:
+                if not first_check:
+                    time.sleep(600)  # 10 minutes = 600 seconds
+                else:
+                    first_check = False
+                    logger.info("Version checker: performing initial check")
+                
+                if not self._version_check_running:
+                    break
+                if self._refreshing:
+                    continue
+                try:
+                    # Fetch latest version silently (no UI prompts)
+                    latest_version = self._fetch_latest_client_version()
+                    if latest_version:
+                        logger.info(f"Version check: latest client version = {latest_version}")
+                        self._latest_client_version = latest_version
+                        # Refresh tree to update highlighting
+                        self.root.after(0, self._refresh_data)
+                except Exception as e:
+                    logger.info(f"Version check failed: {e}")
+        
+        threading.Thread(target=version_checker, daemon=True).start()
 
     def _process_queue(self):
         """Process messages from background thread in main UI thread"""
