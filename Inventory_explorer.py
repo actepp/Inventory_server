@@ -17,28 +17,17 @@ from packaging import version
 import tkinter as tk
 from tkinter import ttk, messagebox, font
 
-# Setup logging with file handler for command tracing
+# Setup logging with file handler for command tracing - DISABLED
 def setup_logger(name, log_file):
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.CRITICAL)  # Disable all logging
     logger.propagate = False
     
     # Clear existing handlers
     logger.handlers.clear()
     
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(console_format)
-    logger.addHandler(console_handler)
-    
-    # File handler for command tracing
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_format)
-    logger.addHandler(file_handler)
+    # Add null handler to prevent "No handlers found" warnings
+    logger.addHandler(logging.NullHandler())
     
     return logger
 
@@ -442,7 +431,7 @@ class InventoryExplorer:
     def _show_client_version_context_menu(self, event, item):
         """Show context menu for client version node"""
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Обновить агент", command=lambda: self._check_client_update(item))
+        # menu.add_command(label="Обновить агент", command=lambda: self._check_client_update(item))
         menu.post(event.x_root, event.y_root)
 
     def _refresh_data(self):
