@@ -387,10 +387,15 @@ class APIClient:
                     for item in result:
                         item['_server_name'] = server['name']
                         item['_server_host'] = server['host']
+                        item['_server_api_port'] = server['api_port']
+                        # Create globally unique ID
+                        item['uid'] = f"{server['host']}:{server['api_port']}:{item['id']}"
                 elif isinstance(result, dict) and 'computers' in result:
                     for item in result['computers']:
                         item['_server_name'] = server['name']
                         item['_server_host'] = server['host']
+                        item['_server_api_port'] = server['api_port']
+                        item['uid'] = f"{server['host']}:{server['api_port']}:{item['id']}"
                 return ('success', server['name'], result)
             except Exception as e:
                 return ('error', server['name'], f"{server['name']} ({server['host']}:{server['api_port']}): {e}")
@@ -427,7 +432,7 @@ class APIClient:
         return all_results, errors
 
     def get_computers(self):
-        """Get computers from all servers, merged into single list"""
+        """Get computers from all servers, merged into single list with unique IDs"""
         all_results, errors = self._query_all_servers('GET', '/api/computers')
         merged = []
         for result in all_results:
@@ -462,36 +467,81 @@ class APIClient:
             'server_version': 'multi'
         }
 
-    def get_devices(self, computer_id):
-        """Get devices for a computer - need to know which server it's from"""
-        # Find the server for this computer
-        servers = self.config.get_servers()
-        for server in servers:
-            try:
-                return self._make_request(server, 'GET', f'/api/computers/{computer_id}/devices')
-            except Exception:
-                continue
-        raise Exception("Компьютер не найден ни на одном сервере")
+    def get_devices(self, uid):
+        """Get devices for a computer using its unique ID"""
+        # Parse server info from uid
+        parts = uid.split(':', 2)
+        if len(parts) != 3:
+            raise Exception(f"Invalid UID format: {uid}")
+        host, api_port, comp_id = parts
+        server = {
+            'host': host,
+            'api_port': int(api_port)
+        }
+        try:
+            return self._make_request(server, 'GET', f'/api/computers/{comp_id}/devices')
+        except Exception as e:
+            raise Exception(f"Failed to get devices: {e}")
 
-    def delete_computer(self, computer_id):
-        servers = self.config.get_servers()
-        for server in servers:
-            try:
-                return self._make_request(server, 'DELETE', f'/api/computers/{computer_id}')
-            except Exception:
-                continue
-        raise Exception("Компьютер не найден ни на одном сервере")
+    def delete_computer(self, uid):
+        parts = uid.split(':', 2)
+        if len(parts) != 3:
+            raise Exception(f"Invalid UID format: {uid}")
+        host, api_port, comp_id = parts
+        server = {
+            'host': host,
+            'api_port': int(api_port)
+        }
+        try:
+            return self._make_request(server, 'DELETE', f'/api/computers/{comp_id}')
+        except Exception as e:
+            raise Exception(f"Failed to delete computer: {e}")
 
-    def poll_computer(self, computer_id):
-        servers = self.config.get_servers()
-        for server in servers:
-            try:
-                result = self._make_request(server, 'POST', f'/api/computers/{computer_id}/poll')
-                cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_COMPUTER | computer_id={computer_id} | server={server['name']}")
-                cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_COMPUTER | computer_id={computer_id} | server={server['name']} | result={result}")
-                return result
-            except Exception:
-                continue
+    def poll_computer(self, uid):
+        parts = uid.split(':', 2)
+        if len(parts) != 3:
+            raise Exception(f"Invalid UID format: {uid}")
+        host, api_port, comp_id = parts
+        server = {
+            'host': host,
+            'api_port': int(api_port)
+        }
+        try:
+            return self._make_request(server, 'POST', f'/api/computers/{comp_id}/poll')
+        except Exception as e:
+            raise Exception(f"Failed to poll computer: {e}")
+
+    def update_computer(self, uid, data):
+        """Update computer data (e.g., comments) on the correct server"""
+        parts = uid.split(':', 2)
+        if len(parts) != 3:
+            raise Exception(f"Invalid UID format: {uid}")
+        host, api_port, comp_id = parts
+        server = {
+            'host': host,
+            'api_port': int(api_port)
+        }
+        try:
+            return self._make_request(server, 'PUT', f'/api/computers/{comp_id}', data)
+        except Exception as e:
+            raise Exception(f"Failed to update computer: {e}")
+
+    def poll_computer(self, uid):
+        parts = uid.split(':', 2)
+        if len(parts) != 3:
+            raise Exception(f"Invalid UID format: {uid}")
+        host, api_port, comp_id = parts
+        server = {
+            'host': host,
+            'api_port': int(api_port)
+        }
+        try:
+            result = self._make_request(server, 'POST', f'/api/computers/{comp_id}/poll')
+            cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_COMPUTER | computer_id={comp_id} | server={host}:{api_port}")
+            cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_COMPUTER | computer_id={comp_id} | server={host}:{api_port} | result={result}")
+            return result
+        except Exception as e:
+            raise Exception(f"Failed to poll computer: {e}")
         raise Exception("Компьютер не найден ни на одном сервере")
 
     def poll_all_computers(self):
@@ -581,14 +631,16 @@ class InventoryExplorer:
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ('info',)
+        columns = ('info', 'comments')
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='tree headings')
         
         self.tree.heading('#0', text=self.loc.get("tree.computer"), anchor=tk.W)
         self.tree.heading('info', text=self.loc.get("tree.info"), anchor=tk.W)
+        self.tree.heading('comments', text=self.loc.get("tree.comments"), anchor=tk.W)
 
         self.tree.column('#0', width=300, minwidth=250, stretch=False)
-        self.tree.column('info', width=500, minwidth=300, stretch=True)
+        self.tree.column('info', width=400, minwidth=300, stretch=True)
+        self.tree.column('comments', width=300, minwidth=200, stretch=True)
 
         # Scrollbars
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -614,6 +666,12 @@ class InventoryExplorer:
         self.context_menu.add_command(label=self.loc.get("menu.refresh"), command=self._poll_selected)
         self.context_menu.add_command(label=self.loc.get("toolbar.delete"), command=self._delete_selected)
         self.tree.bind("<Button-3>", self._show_context_menu)
+        
+        # Comments column inline editing
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self._comments_edit_widget = None
+        self._comments_edit_item = None
+        self._comments_edit_column = None
 
     def _create_menu(self):
         menubar = tk.Menu(self.root)
@@ -741,6 +799,114 @@ class InventoryExplorer:
         menu = tk.Menu(self.root, tearoff=0)
         # menu.add_command(label="Обновить агент", command=lambda: self._check_client_update(item))
         menu.post(event.x_root, event.y_root)
+
+    def _on_double_click(self, event):
+        """Handle double-click on tree - start editing comments column"""
+        # Identify what was clicked
+        region = self.tree.identify_region(event.x, event.y)
+        if region != 'cell':
+            return
+        
+        column = self.tree.identify_column(event.x)
+        if column != '#2':  # comments column is #2 (0-based: #0=tree, #1=info, #2=comments)
+            return
+        
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        
+        # Only allow editing on computer items (top-level items), not child nodes
+        parent = self.tree.parent(item)
+        if parent:  # This is a child node, not a computer
+            return
+        
+        self._start_comments_edit(item)
+
+    def _start_comments_edit(self, item):
+        """Start inline editing of comments for a computer item"""
+        # Get current comments value
+        values = self.tree.item(item, 'values')
+        current_comments = values[1] if len(values) > 1 else ''
+        
+        # Get cell bounding box
+        bbox = self.tree.bbox(item, '#2')
+        if not bbox:
+            return
+        
+        x, y, width, height = bbox
+        
+        # Create entry widget
+        self._comments_edit_widget = ttk.Entry(self.tree)
+        self._comments_edit_widget.place(x=x, y=y, width=width, height=height)
+        self._comments_edit_widget.insert(0, current_comments)
+        self._comments_edit_widget.select_range(0, tk.END)
+        self._comments_edit_widget.focus_set()
+        
+        self._comments_edit_item = item
+        self._comments_edit_column = '#2'
+        
+        # Bind events
+        self._comments_edit_widget.bind('<Return>', self._save_comments_edit)
+        self._comments_edit_widget.bind('<Escape>', self._cancel_comments_edit)
+        self._comments_edit_widget.bind('<FocusOut>', self._save_comments_edit)
+
+    def _save_comments_edit(self, event=None):
+        """Save edited comments to server"""
+        if not self._comments_edit_widget or not self._comments_edit_item:
+            return
+        
+        new_comments = self._comments_edit_widget.get()
+        item = self._comments_edit_item
+        
+        # Update tree immediately
+        values = list(self.tree.item(item, 'values'))
+        if len(values) >= 2:
+            values[1] = new_comments
+        else:
+            values = [values[0] if values else '', new_comments]
+        self.tree.item(item, values=values)
+        
+        # Find computer UID and save to server
+        computer_text = self.tree.item(item, 'text').strip()
+        uid = None
+        for cid, comp in self.computers_data.items():
+            if computer_text == comp['hostname']:
+                uid = cid
+                break
+        
+        if uid:
+            # Update local data
+            self.computers_data[uid]['comments'] = new_comments
+            
+            # Save to server in background
+            threading.Thread(target=self._do_save_comments, args=(uid, new_comments), daemon=True).start()
+        else:
+            logger.warning(f"_save_comments_edit: uid not found for {computer_text}")
+        
+        # Clean up
+        self._comments_edit_widget.destroy()
+        self._comments_edit_widget = None
+        self._comments_edit_item = None
+        self._comments_edit_column = None
+
+    def _cancel_comments_edit(self, event=None):
+        """Cancel comments editing without saving"""
+        if self._comments_edit_widget:
+            self._comments_edit_widget.destroy()
+            self._comments_edit_widget = None
+            self._comments_edit_item = None
+            self._comments_edit_column = None
+
+    def _do_save_comments(self, uid, comments):
+        """Background task to save comments to server"""
+        logger.info(f"_do_save_comments: saving comments for uid={uid}")
+        try:
+            result = self.api_client.update_computer(uid, {'comments': comments})
+            logger.info(f"_do_save_comments: success for uid={uid}")
+        except Exception as e:
+            logger.error(f"_do_save_comments: failed for uid={uid}: {e}")
+            # Optionally show error in UI
+            self.root.after(0, lambda: self.status_var.set(f"Ошибка сохранения комментария: {e}"))
 
     def _refresh_data(self):
         if getattr(self, '_refreshing', False):
@@ -945,12 +1111,15 @@ class InventoryExplorer:
         expanded_items = []
         
         for comp in computers:
-            comp_id = comp['id']
-            self.computers_data[comp_id] = comp
+            uid = comp.get('uid', comp['id'])
+            self.computers_data[uid] = comp
+            
+            # Get comments from computer data
+            comments = comp.get('comments', '')
             
             item_id = self.tree.insert('', 'end', 
                 text=f"  {comp['hostname']}",
-                values=(''),
+                values=('', comments),
                 open=False)
             
             # Add system info as child nodes
@@ -1069,15 +1238,15 @@ class InventoryExplorer:
                     return
 
     def _load_devices(self, computer_item):
-        comp_id = None
+        uid = None
         computer_text = self.tree.item(computer_item, 'text').strip()
         for cid, comp in self.computers_data.items():
             if computer_text == comp['hostname']:
-                comp_id = cid
+                uid = cid
                 break
         
-        if not comp_id:
-            logger.warning(f"_load_devices: comp_id not found for {computer_text}")
+        if not uid:
+            logger.warning(f"_load_devices: uid not found for {computer_text}")
             return
         
         loading_text = self.loc.get("tree.loading")
@@ -1086,7 +1255,7 @@ class InventoryExplorer:
         children = self.tree.get_children(computer_item)
         for child in children:
             if loading_text.lower() in self.tree.item(child, 'text').lower():
-                logger.info(f"_load_devices: already loading for {computer_text} (comp_id={comp_id}), skipping")
+                logger.info(f"_load_devices: already loading for {computer_text} (uid={uid}), skipping")
                 return  # Already loading
         
         # Remove any existing device nodes (will be replaced with fresh data)
@@ -1098,26 +1267,26 @@ class InventoryExplorer:
                 cleared_count += 1
         
         if cleared_count > 0:
-            logger.info(f"_load_devices: cleared {cleared_count} existing device nodes for {computer_text} (comp_id={comp_id})")
+            logger.info(f"_load_devices: cleared {cleared_count} existing device nodes for {computer_text} (uid={uid})")
         
         # Add loading placeholder
         self.tree.insert(computer_item, 'end', text=loading_text, values=(''))
-        logger.info(f"_load_devices: started loading for {computer_text} (comp_id={comp_id})")
+        logger.info(f"_load_devices: started loading for {computer_text} (uid={uid})")
         
         # Load devices in background
-        threading.Thread(target=self._do_load_devices, args=(computer_item, comp_id), daemon=True).start()
+        threading.Thread(target=self._do_load_devices, args=(computer_item, uid), daemon=True).start()
 
-    def _do_load_devices(self, computer_item, comp_id):
+    def _do_load_devices(self, computer_item, uid):
         """Background task to load devices"""
-        logger.info(f"_do_load_devices: requesting devices for comp_id={comp_id}")
+        logger.info(f"_do_load_devices: requesting devices for uid={uid}")
         try:
-            devices = self.api_client.get_devices(comp_id)
-            logger.info(f"_do_load_devices: received {len(devices)} devices for comp_id={comp_id}")
+            devices = self.api_client.get_devices(uid)
+            logger.info(f"_do_load_devices: received {len(devices)} devices for uid={uid}")
             for dev in devices:
                 logger.debug(f"  Device: class={dev.get('device_class')}, name={dev.get('device_name')}")
             self.root.after(0, lambda: self._populate_devices(computer_item, devices))
         except Exception as e:
-            logger.error(f"_do_load_devices: failed for comp_id={comp_id}: {e}")
+            logger.error(f"_do_load_devices: failed for uid={uid}: {e}")
             self.root.after(0, lambda: self._show_device_error(computer_item, e))
             
     def _show_device_error(self, computer_item, error):
@@ -1250,7 +1419,7 @@ class InventoryExplorer:
                 if value and value != 'N/A':
                     self.tree.insert(parent_item, 'end', text=f'    {key}', values=(value,))
 
-    def _get_computer_id_from_item(self, item):
+    def _get_computer_uid_from_item(self, item):
         hostname = self.tree.item(item, 'text').strip()
         for cid, comp in self.computers_data.items():
             if comp['hostname'] == hostname:
@@ -1271,9 +1440,9 @@ class InventoryExplorer:
             self.status_var.set(self.loc.get("status.deleting"))
             threading.Thread(target=self._do_delete, args=(self.selected_computer_id,), daemon=True).start()
 
-    def _do_delete(self, computer_id):
+    def _do_delete(self, uid):
         try:
-            self.api_client.delete_computer(computer_id)
+            self.api_client.delete_computer(uid)
             self.root.after(0, self._refresh_data)
             self.root.after(0, lambda: self.status_var.set(self.loc.get("status.deleted")))
         except Exception as e:
@@ -1288,9 +1457,9 @@ class InventoryExplorer:
         self.status_var.set(self.loc.get("status.polling"))
         threading.Thread(target=self._do_poll_and_refresh, args=(self.selected_computer_id,), daemon=True).start()
 
-    def _do_poll_and_refresh(self, computer_id):
+    def _do_poll_and_refresh(self, uid):
         try:
-            result = self.api_client.poll_computer(computer_id)
+            result = self.api_client.poll_computer(uid)
             self.root.after(0, lambda: self.status_var.set(self.loc.get("status.poll_sent_wait")))
             # Wait for client to respond and send inventory
             time.sleep(1.5)
@@ -1314,27 +1483,27 @@ class InventoryExplorer:
 
     def _check_client_update(self, version_item):
         """Check for client agent update from GitHub releases"""
-        # Get computer ID from parent item
+        # Get computer UID from parent item
         computer_item = self.tree.parent(version_item)
         if not computer_item:
             return
         
         computer_text = self.tree.item(computer_item, 'text').strip()
-        comp_id = None
+        uid = None
         for cid, comp in self.computers_data.items():
             if computer_text == comp['hostname']:
-                comp_id = cid
+                uid = cid
                 break
         
-        if not comp_id:
+        if not uid:
             return
         
         current_version = self.tree.item(version_item, 'values')[0] if self.tree.item(version_item, 'values') else '?'
         self.status_var.set(self.loc.get("status.checking_updates"))
         
-        threading.Thread(target=self._do_check_client_update, args=(comp_id, current_version, version_item), daemon=True).start()
+        threading.Thread(target=self._do_check_client_update, args=(uid, current_version, version_item), daemon=True).start()
 
-    def _do_check_client_update(self, comp_id, current_version, version_item):
+    def _do_check_client_update(self, uid, current_version, version_item):
         """Background task to check for client update"""
         try:
             latest_version = self._fetch_latest_client_version()
@@ -1355,7 +1524,7 @@ class InventoryExplorer:
                 latest_ver = latest_version
             
             if latest_ver > current_ver:
-                self.root.after(0, lambda: self._prompt_update(comp_id, current_version, latest_version, version_item))
+                self.root.after(0, lambda: self._prompt_update(uid, current_version, latest_version, version_item))
             else:
                 self.root.after(0, lambda: self._show_update_result("Обновлений нет"))
                 
@@ -1442,7 +1611,7 @@ class InventoryExplorer:
             logger.error(f"Fallback failed: {type(e).__name__}: {e}")
             return None
 
-    def _prompt_update(self, comp_id, current_version, latest_version, version_item):
+    def _prompt_update(self, uid, current_version, latest_version, version_item):
         """Show update confirmation dialog"""
         self.status_var.set("Готов")
         result = messagebox.askyesno(
@@ -1453,11 +1622,11 @@ class InventoryExplorer:
             f"Обновить агент на этом компьютере?"
         )
         if result:
-            self._start_client_update(comp_id, latest_version, version_item)
+            self._start_client_update(uid, latest_version, version_item)
         else:
             self.status_var.set("Обновление отменено")
 
-    def _start_client_update(self, comp_id, latest_version, version_item):
+    def _start_client_update(self, uid, latest_version, version_item):
         """Start client update process (placeholder for now)"""
         # TODO: Implement actual update mechanism
         # For now just show a message

@@ -136,6 +136,11 @@ class DatabaseManager:
                 cursor.execute('ALTER TABLE computers ADD COLUMN client_version TEXT')
             except sqlite3.OperationalError:
                 pass
+            # Add comments column if not exists
+            try:
+                cursor.execute('ALTER TABLE computers ADD COLUMN comments TEXT DEFAULT ""')
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
         logger.info("Database initialized")
 
@@ -213,7 +218,7 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, hostname, ip_address, mac_address, os_name, os_version,
-                cpu_info, ram_total_gb, last_seen, last_heartbeat, client_version
+                cpu_info, ram_total_gb, last_seen, last_heartbeat, client_version, comments
                 FROM computers 
                 WHERE last_heartbeat IS NOT NULL 
                 AND datetime(last_heartbeat) > datetime('now', ?)
@@ -227,7 +232,7 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, hostname, ip_address, mac_address, os_name, os_version,
-                cpu_info, ram_total_gb, last_seen, last_heartbeat, poll_requested, client_version
+                cpu_info, ram_total_gb, last_seen, last_heartbeat, poll_requested, client_version, comments
                 FROM computers ORDER BY hostname
             ''')
             return cursor.fetchall()
@@ -259,6 +264,13 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('UPDATE computers SET poll_requested = 1')
+            conn.commit()
+
+    def update_computer_comments(self, computer_id: int, comments: str):
+        """Update comments for a computer"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE computers SET comments = ? WHERE id = ?', (comments, computer_id))
             conn.commit()
 
 
@@ -354,6 +366,40 @@ class APIRequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_json({'error': 'Not found'}, 404)
 
+    def do_PUT(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        
+        if path.startswith('/api/computers/'):
+            computer_id = path.split('/')[3]
+            self._handle_update_computer(computer_id)
+        else:
+            self._send_json({'error': 'Not found'}, 404)
+
+    def _handle_update_computer(self, computer_id):
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                self._send_json({'error': 'Empty request body'}, 400)
+                return
+            
+            body = self.rfile.read(content_length).decode('utf-8')
+            data = json.loads(body)
+            
+            comments = data.get('comments', '')
+            if not isinstance(comments, str):
+                self._send_json({'error': 'comments must be a string'}, 400)
+                return
+            
+            self.db_manager.update_computer_comments(int(computer_id), comments)
+            logger.info(f"Updated comments for computer {computer_id}")
+            self._send_json({'success': True, 'comments': comments})
+        except json.JSONDecodeError:
+            self._send_json({'error': 'Invalid JSON'}, 400)
+        except Exception as e:
+            logger.error(f"API error updating computer: {e}")
+            self._send_json({'error': str(e)}, 500)
+
     def _handle_poll_computer(self, computer_id):
         try:
             cmd_logger.info(f"COMMAND SENT: Explorer -> Server | POLL_COMPUTER | computer_id={computer_id}")
@@ -401,7 +447,8 @@ class APIRequestHandler(BaseHTTPRequestHandler):
                     'last_seen': c[8],
                     'last_heartbeat': c[9],
                     'is_online': is_online,
-                    'client_version': c[11]
+                    'client_version': c[11],
+                    'comments': c[12] if c[12] else ''
                 })
             self._send_json(result)
         except Exception as e:
@@ -424,7 +471,8 @@ class APIRequestHandler(BaseHTTPRequestHandler):
                     'ram_total_gb': c[7],
                     'last_seen': c[8],
                     'last_heartbeat': c[9],
-                    'client_version': c[10]
+                    'client_version': c[10],
+                    'comments': c[11] if c[11] else ''
                 })
             self._send_json({
                 'online_count': len(result),

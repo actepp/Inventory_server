@@ -82,6 +82,7 @@ STRINGS = {
   "tree.cpu": "🔧 Процессор",
   "tree.ram": "💾 Оперативная память",
   "tree.last_seen": "🕐 Последний раз",
+  "tree.comments": "Комментарии",
   "tree.unknown": "Unknown",
   "tree.gb": "{} GB",
   "device.class.Processor": "Процессор",
