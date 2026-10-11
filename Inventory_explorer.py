@@ -558,8 +558,67 @@ class InventoryExplorer:
         help_menu.add_command(label="О программе", command=self._show_about)
         menubar.add_cascade(label="Справка", menu=help_menu)
 
+        # Support menu
+        support_menu = tk.Menu(menubar, tearoff=0)
+        support_menu.add_command(label="💛 DonationAlerts", command=self._show_donation)
+        menubar.add_cascade(label="Поддержать", menu=support_menu)
+
         self.root.config(menu=menubar)
         self.root.bind('<F5>', lambda e: self._refresh_data())
+
+    def _show_donation(self):
+        """Show donation support dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Поддержать проект")
+        dialog.geometry("480x380")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center on parent
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - 480) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - 380) // 2
+        dialog.geometry(f"+{x}+{y}")
+        
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Icon/title
+        ttk.Label(main_frame, text="💛", font=('Segoe UI', 48)).pack(pady=(0, 10))
+        ttk.Label(main_frame, text="Поддержать разработку", font=('Segoe UI', 14, 'bold')).pack(pady=(0, 10))
+        
+        # Message
+        msg = ("Если вам нравится этот проект и вы хотите поддержать его развитие,\n"
+               "вы можете сделать пожертвование через DonationAlerts.\n\n"
+               "Каждая поддержка мотивирует делать проект лучше!")
+        ttk.Label(main_frame, text=msg, font=('Segoe UI', 10), justify=tk.CENTER, wraplength=420).pack(pady=(0, 20))
+        
+        # Link frame
+        link_frame = ttk.Frame(main_frame)
+        link_frame.pack(pady=10, fill=tk.X)
+        
+        # Clickable link
+        link_label = ttk.Label(link_frame, text="https://www.donationalerts.com/r/actepp", 
+                               font=('Segoe UI', 10, 'underline'), foreground='blue', cursor='hand2')
+        link_label.pack(pady=(0, 5))
+        link_label.bind('<Button-1>', lambda e: self._open_url("https://www.donationalerts.com/r/actepp"))
+        
+        # Copy button
+        def copy_link():
+            self.root.clipboard_clear()
+            self.root.clipboard_append("https://www.donationalerts.com/r/actepp")
+            self.status_var.set("Ссылка скопирована в буфер обмена")
+            
+        ttk.Button(link_frame, text="📋 Копировать ссылку", command=copy_link).pack(pady=5)
+        
+        # Close button
+        ttk.Button(main_frame, text="Закрыть", command=dialog.destroy).pack(pady=(20, 0))
+        
+    def _open_url(self, url):
+        """Open URL in default browser"""
+        import webbrowser
+        webbrowser.open(url)
 
     def _start_push_server(self):
         """Start push notification server and register with inventory server"""
@@ -1323,10 +1382,40 @@ class InventoryExplorer:
         # Status checker will pick up new interval on next iteration
 
     def _show_about(self):
-        messagebox.showinfo("О программе", 
-            "Инвентаризация - Обозреватель\n\n"
-            "Просмотр и управление инвентаризацией компьютеров сети.\n"
-            "Версия 1.0")
+        """Show about dialog with clickable link"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("О программе")
+        dialog.geometry("400x280")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center on parent
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - 400) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - 280) // 2
+        dialog.geometry(f"+{x}+{y}")
+        
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main_frame, text="🖥", font=('Segoe UI', 48)).pack(pady=(0, 10))
+        ttk.Label(main_frame, text="Инвентаризация — Обозреватель", font=('Segoe UI', 12, 'bold')).pack(pady=(0, 5))
+        ttk.Label(main_frame, text="Версия 1.0", font=('Segoe UI', 10)).pack(pady=(0, 15))
+        
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        ttk.Label(main_frame, text="Просмотр и управление инвентаризацией\nкомпьютеров сети", font=('Segoe UI', 9), justify=tk.CENTER).pack(pady=(0, 15))
+        
+        # Clickable link
+        link_label = ttk.Label(main_frame, text="https://github.com/actep/Inventory_server", 
+                               font=('Segoe UI', 9, 'underline'), foreground='blue', cursor='hand2')
+        link_label.pack(pady=5)
+        link_label.bind('<Button-1>', lambda e: self._open_url("https://github.com/actep/Inventory_server"))
+        
+        ttk.Label(main_frame, text="Автор: actepp", font=('Segoe UI', 9)).pack(pady=(10, 0))
+        
+        ttk.Button(main_frame, text="Закрыть", command=dialog.destroy).pack(pady=(20, 0))
 
     def _on_close(self):
         self._status_check_running = False
