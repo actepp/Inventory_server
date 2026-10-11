@@ -162,14 +162,30 @@ class ExplorerConfig:
                     if 'check_interval' not in config:
                         config['check_interval'] = DEFAULT_CHECK_INTERVAL
                         self.save(config)
+                    # Migration: convert old single-server config to new multi-server format
+                    if 'servers' not in config and 'server_ip' in config:
+                        config['servers'] = [{
+                            'name': 'Основной сервер',
+                            'host': config['server_ip'],
+                            'api_port': config.get('api_port', DEFAULT_API_PORT),
+                            'server_port': config.get('server_port', DEFAULT_SERVER_PORT)
+                        }]
+                        # Remove old keys
+                        config.pop('server_ip', None)
+                        config.pop('server_port', None)
+                        config.pop('api_port', None)
+                        self.save(config)
                     return config
             except Exception as e:
                 logger.error(f"Failed to load config: {e}")
         # First run - create default config
         default_config = {
-            'server_ip': DEFAULT_SERVER_IP,
-            'server_port': DEFAULT_SERVER_PORT,
-            'api_port': DEFAULT_API_PORT,
+            'servers': [{
+                'name': 'Основной сервер',
+                'host': DEFAULT_SERVER_IP,
+                'api_port': DEFAULT_API_PORT,
+                'server_port': DEFAULT_SERVER_PORT
+            }],
             'check_interval': DEFAULT_CHECK_INTERVAL
         }
         self.save(default_config)
@@ -186,22 +202,71 @@ class ExplorerConfig:
             logger.error(f"Failed to save config: {e}")
             raise
 
-    def get_server_ip(self):
-        return self.config.get('server_ip', DEFAULT_SERVER_IP)
+    def get_servers(self):
+        """Get list of configured servers"""
+        return self.config.get('servers', [])
 
-    def get_server_port(self):
-        return self.config.get('server_port', DEFAULT_SERVER_PORT)
+    def add_server(self, name: str, host: str, api_port: int, server_port: int):
+        """Add a new server"""
+        servers = self.get_servers()
+        servers.append({
+            'name': name,
+            'host': host,
+            'api_port': api_port,
+            'server_port': server_port
+        })
+        self.config['servers'] = servers
+        self.save()
 
-    def get_api_port(self):
-        return self.config.get('api_port', DEFAULT_API_PORT)
+    def remove_server(self, index: int):
+        """Remove server by index"""
+        servers = self.get_servers()
+        if 0 <= index < len(servers):
+            servers.pop(index)
+            self.config['servers'] = servers
+            self.save()
+
+    def update_server(self, index: int, name: str, host: str, api_port: int, server_port: int):
+        """Update server configuration"""
+        servers = self.get_servers()
+        if 0 <= index < len(servers):
+            servers[index] = {
+                'name': name,
+                'host': host,
+                'api_port': api_port,
+                'server_port': server_port
+            }
+            self.config['servers'] = servers
+            self.save()
 
     def get_check_interval(self):
         return self.config.get('check_interval', DEFAULT_CHECK_INTERVAL)
 
+    def set_check_interval(self, interval: int):
+        self.config['check_interval'] = interval
+        self.save()
+
+    # Backward compatibility
+    def get_server_ip(self):
+        servers = self.get_servers()
+        return servers[0]['host'] if servers else DEFAULT_SERVER_IP
+
+    def get_server_port(self):
+        servers = self.get_servers()
+        return servers[0]['server_port'] if servers else DEFAULT_SERVER_PORT
+
+    def get_api_port(self):
+        servers = self.get_servers()
+        return servers[0]['api_port'] if servers else DEFAULT_API_PORT
+
     def set_config(self, server_ip: str, server_port: int, api_port: int, check_interval: int):
-        self.config['server_ip'] = server_ip
-        self.config['server_port'] = server_port
-        self.config['api_port'] = api_port
+        """Legacy single-server config setter"""
+        self.config['servers'] = [{
+            'name': 'Основной сервер',
+            'host': server_ip,
+            'api_port': api_port,
+            'server_port': server_port
+        }]
         self.config['check_interval'] = check_interval
         self.save()
 
@@ -210,8 +275,8 @@ class APIClient:
     def __init__(self, config: ExplorerConfig):
         self.config = config
 
-    def _make_request(self, method: str, endpoint: str, data=None):
-        url = f"http://{self.config.get_server_ip()}:{self.config.get_api_port()}{endpoint}"
+    def _make_request(self, server: dict, method: str, endpoint: str, data=None):
+        url = f"http://{server['host']}:{server['api_port']}{endpoint}"
         headers = {'Content-Type': 'application/json'}
         
         if data:
@@ -236,29 +301,105 @@ class APIClient:
         except Exception as e:
             raise Exception(f"Request failed: {e}")
 
+    def _query_all_servers(self, method: str, endpoint: str, data=None):
+        """Query all configured servers and aggregate results"""
+        servers = self.config.get_servers()
+        all_results = []
+        errors = []
+        
+        for server in servers:
+            try:
+                result = self._make_request(server, method, endpoint, data)
+                # Add server info to each computer for identification
+                if isinstance(result, list):
+                    for item in result:
+                        item['_server_name'] = server['name']
+                        item['_server_host'] = server['host']
+                elif isinstance(result, dict) and 'computers' in result:
+                    for item in result['computers']:
+                        item['_server_name'] = server['name']
+                        item['_server_host'] = server['host']
+                all_results.append(result)
+            except Exception as e:
+                errors.append(f"{server['name']} ({server['host']}:{server['api_port']}): {e}")
+        
+        return all_results, errors
+
     def get_computers(self):
-        return self._make_request('GET', '/api/computers')
+        """Get computers from all servers, merged into single list"""
+        all_results, errors = self._query_all_servers('GET', '/api/computers')
+        merged = []
+        for result in all_results:
+            if isinstance(result, list):
+                merged.extend(result)
+        # If any server had errors, raise exception with details
+        if errors:
+            raise Exception("Ошибки подключения: " + "; ".join(errors))
+        return merged
 
     def get_online(self):
-        return self._make_request('GET', '/api/online')
+        """Get online status from all servers"""
+        all_results, errors = self._query_all_servers('GET', '/api/online')
+        merged_computers = []
+        total_online = 0
+        for result in all_results:
+            if isinstance(result, dict) and 'computers' in result:
+                merged_computers.extend(result['computers'])
+                total_online += result.get('online_count', 0)
+        if errors:
+            raise Exception("Ошибки подключения: " + "; ".join(errors))
+        return {
+            'online_count': total_online,
+            'computers': merged_computers,
+            'server_version': 'multi'
+        }
 
     def get_devices(self, computer_id):
-        return self._make_request('GET', f'/api/computers/{computer_id}/devices')
+        """Get devices for a computer - need to know which server it's from"""
+        # Find the server for this computer
+        servers = self.config.get_servers()
+        for server in servers:
+            try:
+                return self._make_request(server, 'GET', f'/api/computers/{computer_id}/devices')
+            except Exception:
+                continue
+        raise Exception("Компьютер не найден ни на одном сервере")
 
     def delete_computer(self, computer_id):
-        return self._make_request('DELETE', f'/api/computers/{computer_id}')
+        servers = self.config.get_servers()
+        for server in servers:
+            try:
+                return self._make_request(server, 'DELETE', f'/api/computers/{computer_id}')
+            except Exception:
+                continue
+        raise Exception("Компьютер не найден ни на одном сервере")
 
     def poll_computer(self, computer_id):
-        cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_COMPUTER | computer_id={computer_id}")
-        result = self._make_request('POST', f'/api/computers/{computer_id}/poll')
-        cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_COMPUTER | computer_id={computer_id} | result={result}")
-        return result
+        servers = self.config.get_servers()
+        for server in servers:
+            try:
+                result = self._make_request(server, 'POST', f'/api/computers/{computer_id}/poll')
+                cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_COMPUTER | computer_id={computer_id} | server={server['name']}")
+                cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_COMPUTER | computer_id={computer_id} | server={server['name']} | result={result}")
+                return result
+            except Exception:
+                continue
+        raise Exception("Компьютер не найден ни на одном сервере")
 
     def poll_all_computers(self):
-        cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_ALL_COMPUTERS")
-        result = self._make_request('POST', '/api/computers/poll-all')
-        cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_ALL_COMPUTERS | result={result}")
-        return result
+        servers = self.config.get_servers()
+        results = []
+        for server in servers:
+            try:
+                result = self._make_request(server, 'POST', '/api/computers/poll-all')
+                cmd_logger.info(f"COMMAND SENT: Explorer -> Server API | POLL_ALL_COMPUTERS | server={server['name']}")
+                cmd_logger.info(f"COMMAND RESPONSE: Server API -> Explorer | POLL_ALL_COMPUTERS | server={server['name']} | result={result}")
+                results.append(result)
+            except Exception as e:
+                cmd_logger.error(f"Poll all failed for {server['name']}: {e}")
+        if not results:
+            raise Exception("Не удалось опросить ни один сервер")
+        return {'success': True, 'results': results}
 
 
 class InventoryExplorer:
@@ -534,6 +675,10 @@ class InventoryExplorer:
 
     def _add_system_info_nodes(self, parent_item, comp):
         """Add system info as child nodes under computer"""
+        # Server name (for multi-server setup)
+        server_name = comp.get('_server_name', 'Unknown')
+        self.tree.insert(parent_item, 'end', text='🏠 Источник данных', values=(server_name,))
+        
         # Client version
         client_version = comp.get('client_version', '?')
         version_item = self.tree.insert(parent_item, 'end', text='📦 Версия агент-клиента', values=(client_version,))
@@ -1089,57 +1234,194 @@ class SettingsWindow:
         self.on_save_callback = on_save_callback
         self.window = tk.Toplevel(parent)
         self.window.title("Настройки Обозревателя")
-        self.window.geometry("400x330")
+        self.window.geometry("550x500")
         self.window.resizable(False, False)
         self.window.transient(parent)
         self.window.grab_set()
 
         self._create_widgets()
         self._center_window(parent)
+        self._refresh_server_list()
 
     def _create_widgets(self):
         main_frame = ttk.Frame(self.window, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+
+        # Header
+        ttk.Label(main_frame, text="Настроенные серверы:", font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+
+        # Server listbox with scrollbar
+        list_frame = ttk.Frame(main_frame)
+        list_frame.grid(row=1, column=0, sticky=tk.NSEW, pady=(0, 10))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+
+        self.server_listbox = tk.Listbox(list_frame, height=8, font=('Consolas', 9))
+        self.server_listbox.grid(row=0, column=0, sticky=tk.NSEW)
+        self.server_listbox.bind('<<ListboxSelect>>', self._on_server_select)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.server_listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        self.server_listbox.configure(yscrollcommand=scrollbar.set)
+
+        # Server management buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 20))
+        
+        ttk.Button(btn_frame, text="➕ Добавить", command=self._add_server).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="✏ Изменить", command=self._edit_server).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="🗑 Удалить", command=self._remove_server).pack(side=tk.LEFT)
+
+        # Separator
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=3, column=0, sticky=tk.EW, pady=(5, 15))
+
+        # Global settings
+        ttk.Label(main_frame, text="Общие настройки:", font=('Segoe UI', 10, 'bold')).grid(row=4, column=0, sticky=tk.W, pady=(0, 10))
+
+        # Check Interval
+        ttk.Label(main_frame, text="Интервал опроса серверов (сек):").grid(row=5, column=0, sticky=tk.W, pady=(0, 5))
+        self.check_interval_var = tk.StringVar(value=str(self.config.get_check_interval()))
+        ttk.Entry(main_frame, textvariable=self.check_interval_var).grid(row=6, column=0, sticky=tk.EW, pady=(0, 20))
+
+        # Spacer row
+        main_frame.rowconfigure(7, weight=1)
+
+        # Separator
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=8, column=0, sticky=tk.EW, pady=(5, 10))
+
+        # Buttons - bottom right
+        btn_frame2 = tk.Frame(main_frame)
+        btn_frame2.grid(row=9, column=0, sticky=tk.E, pady=(0, 10))
+
+        tk.Button(btn_frame2, text="Отмена", command=self.on_cancel, 
+                  bg='#e74c3c', fg='white', activebackground='#c0392b', activeforeground='white',
+                  relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT, padx=(0, 10))
+        tk.Button(btn_frame2, text="Сохранить", command=self.on_save,
+                  bg='#27ae60', fg='white', activebackground='#219150', activeforeground='white',
+                  relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT)
+
+    def _refresh_server_list(self):
+        self.server_listbox.delete(0, tk.END)
+        servers = self.config.get_servers()
+        for i, server in enumerate(servers):
+            display = f"{server['name']}  ({server['host']}:{server['api_port']})"
+            self.server_listbox.insert(tk.END, display)
+        if servers:
+            self.server_listbox.selection_set(0)
+            self._on_server_select(None)
+
+    def _on_server_select(self, event):
+        # Enable/disable edit/remove buttons based on selection
+        pass
+
+    def _add_server(self):
+        self._server_dialog("Добавить сервер")
+
+    def _edit_server(self):
+        selection = self.server_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Внимание", "Выберите сервер для редактирования")
+            return
+        index = selection[0]
+        self._server_dialog("Изменить сервер", index)
+
+    def _remove_server(self):
+        selection = self.server_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Внимание", "Выберите сервер для удаления")
+            return
+        index = selection[0]
+        server = self.config.get_servers()[index]
+        if messagebox.askyesno("Подтверждение", f"Удалить сервер '{server['name']}'?"):
+            self.config.remove_server(index)
+            self._refresh_server_list()
+
+    def _server_dialog(self, title, edit_index=None):
+        """Dialog for adding/editing a server"""
+        dialog = tk.Toplevel(self.window)
+        dialog.title(title)
+        dialog.geometry("400x300")
+        dialog.resizable(False, False)
+        dialog.transient(self.window)
+        dialog.grab_set()
+
+        # Pre-fill if editing
+        servers = self.config.get_servers()
+        if edit_index is not None and 0 <= edit_index < len(servers):
+            server = servers[edit_index]
+            name_val, host_val = server['name'], server['host']
+            api_port_val, server_port_val = str(server['api_port']), str(server['server_port'])
+        else:
+            name_val = host_val = api_port_val = server_port_val = ""
+
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
         main_frame.columnconfigure(1, weight=1)
 
-        # Server IP
-        ttk.Label(main_frame, text="IP адрес сервера:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
-        self.ip_var = tk.StringVar(value=self.config.get_server_ip())
-        ttk.Entry(main_frame, textvariable=self.ip_var).grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
+        # Name
+        ttk.Label(main_frame, text="Имя сервера (для отображения):").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        name_var = tk.StringVar(value=name_val)
+        ttk.Entry(main_frame, textvariable=name_var).grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
-        # Server Port
-        ttk.Label(main_frame, text="Порт сервера (агенты):").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
-        self.port_var = tk.StringVar(value=str(self.config.get_server_port()))
-        ttk.Entry(main_frame, textvariable=self.port_var).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
+        # Host (IP or hostname)
+        ttk.Label(main_frame, text="Адрес сервера (IP или имя):").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
+        host_var = tk.StringVar(value=host_val)
+        ttk.Entry(main_frame, textvariable=host_var).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
         # API Port
         ttk.Label(main_frame, text="Порт API (веб):").grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
-        self.api_port_var = tk.StringVar(value=str(self.config.get_api_port()))
-        ttk.Entry(main_frame, textvariable=self.api_port_var).grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
+        api_port_var = tk.StringVar(value=api_port_val)
+        ttk.Entry(main_frame, textvariable=api_port_var).grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
-        # Check Interval
-        ttk.Label(main_frame, text="Интервал опроса сервера (сек):").grid(row=6, column=0, sticky=tk.W, pady=(0, 5))
-        self.check_interval_var = tk.StringVar(value=str(self.config.get_check_interval()))
-        ttk.Entry(main_frame, textvariable=self.check_interval_var).grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(0, 20))
+        # Server Port (agents)
+        ttk.Label(main_frame, text="Порт сервера (агенты):").grid(row=6, column=0, sticky=tk.W, pady=(0, 5))
+        server_port_var = tk.StringVar(value=server_port_val)
+        ttk.Entry(main_frame, textvariable=server_port_var).grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(0, 20))
 
-        # Spacer row
+        # Spacer
         main_frame.rowconfigure(8, weight=1)
 
-        # Separator
-        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=(5, 10))
-
-        # Buttons - bottom right, using tk.Button for custom colors
+        # Buttons
         btn_frame = tk.Frame(main_frame)
-        btn_frame.grid(row=10, column=0, columnspan=2, sticky=tk.E, pady=(0, 10))
+        btn_frame.grid(row=9, column=0, columnspan=2, sticky=tk.E, pady=(0, 10))
 
-        # Cancel - red
-        tk.Button(btn_frame, text="Отмена", command=self.on_cancel, 
+        def on_save():
+            try:
+                name = name_var.get().strip()
+                host = host_var.get().strip()
+                if not name or not host:
+                    raise ValueError("Имя и адрес сервера обязательны")
+                
+                api_port = int(api_port_var.get())
+                server_port = int(server_port_var.get())
+                
+                for port in (api_port, server_port):
+                    if not (1 <= port <= 65535):
+                        raise ValueError("Порт должен быть 1-65535")
+                
+                if api_port == server_port:
+                    raise ValueError("Порты API и сервера должны отличаться")
+                
+                if edit_index is not None:
+                    self.config.update_server(edit_index, name, host, api_port, server_port)
+                else:
+                    self.config.add_server(name, host, api_port, server_port)
+                
+                self._refresh_server_list()
+                dialog.destroy()
+            except ValueError as e:
+                messagebox.showerror("Ошибка", str(e))
+
+        tk.Button(btn_frame, text="Отмена", command=dialog.destroy, 
                   bg='#e74c3c', fg='white', activebackground='#c0392b', activeforeground='white',
                   relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT, padx=(0, 10))
-        # Save - green
-        tk.Button(btn_frame, text="Сохранить", command=self.on_save,
+        tk.Button(btn_frame, text="Сохранить", command=on_save,
                   bg='#27ae60', fg='white', activebackground='#219150', activeforeground='white',
                   relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT)
+
+        self._center_dialog(dialog)
 
     def _center_window(self, parent):
         self.window.update_idletasks()
@@ -1147,39 +1429,21 @@ class SettingsWindow:
         y = parent.winfo_y() + (parent.winfo_height() // 2) - (self.window.winfo_height() // 2)
         self.window.geometry(f"+{x}+{y}")
 
+    def _center_dialog(self, dialog):
+        dialog.update_idletasks()
+        x = self.window.winfo_x() + (self.window.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.window.winfo_y() + (self.window.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+
     def on_save(self):
         try:
-            server_ip = self.ip_var.get().strip()
-            if not server_ip:
-                raise ValueError("IP адрес не может быть пустым")
-            
-            server_port = int(self.port_var.get())
-            api_port = int(self.api_port_var.get())
             check_interval = int(self.check_interval_var.get())
-            
-            for port in (server_port, api_port):
-                if not (1 <= port <= 65535):
-                    raise ValueError("Порт должен быть 1-65535")
-            
-            if server_port == api_port:
-                raise ValueError("Порты сервера и API должны отличаться")
-            
             if check_interval < 5:
                 raise ValueError("Интервал опроса не может быть меньше 5 секунд")
             
-            # Check if anything actually changed
-            ip_changed = server_ip != self.config.get_server_ip()
-            port_changed = server_port != self.config.get_server_port()
-            api_port_changed = api_port != self.config.get_api_port()
-            interval_changed = check_interval != self.config.get_check_interval()
+            self.config.set_check_interval(check_interval)
             
-            something_changed = ip_changed or port_changed or api_port_changed or interval_changed
-            
-            self.config.set_config(server_ip, server_port, api_port, check_interval)
-            
-            if something_changed:
-                self.on_save_callback()
-            
+            self.on_save_callback()
             self.window.destroy()
         except ValueError as e:
             messagebox.showerror("Ошибка", str(e))
