@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+import concurrent.futures
 import queue
 import urllib.request
 import urllib.error
@@ -301,13 +302,14 @@ class APIClient:
         except Exception as e:
             raise Exception(f"Request failed: {e}")
 
-    def _query_all_servers(self, method: str, endpoint: str, data=None):
-        """Query all configured servers and aggregate results"""
+    def _query_all_servers(self, method: str, endpoint: str, data=None, timeout=3.0):
+        """Query all configured servers in parallel, return partial results quickly"""
         servers = self.config.get_servers()
         all_results = []
         errors = []
+        processed_futures = set()
         
-        for server in servers:
+        def query_server(server):
             try:
                 result = self._make_request(server, method, endpoint, data)
                 # Add server info to each computer for identification
@@ -319,9 +321,38 @@ class APIClient:
                     for item in result['computers']:
                         item['_server_name'] = server['name']
                         item['_server_host'] = server['host']
-                all_results.append(result)
+                return ('success', server['name'], result)
             except Exception as e:
-                errors.append(f"{server['name']} ({server['host']}:{server['api_port']}): {e}")
+                return ('error', server['name'], f"{server['name']} ({server['host']}:{server['api_port']}): {e}")
+        
+        # Run all queries in parallel WITHOUT waiting for slow ones
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(servers))
+        try:
+            futures = {executor.submit(query_server, server): server for server in servers}
+            # Wait for results with overall timeout - return whatever we got
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=timeout):
+                    processed_futures.add(future)
+                    status, name, result = future.result()
+                    if status == 'success':
+                        all_results.append(result)
+                    else:
+                        errors.append(result)
+            except concurrent.futures.TimeoutError:
+                # Timeout reached - collect any completed results not yet processed
+                for future in futures:
+                    if future.done() and future not in processed_futures:
+                        try:
+                            status, name, result = future.result()
+                            if status == 'success':
+                                all_results.append(result)
+                            else:
+                                errors.append(result)
+                        except Exception:
+                            pass
+        finally:
+            # Don't wait for slow futures - shutdown without waiting
+            executor.shutdown(wait=False)
         
         return all_results, errors
 
@@ -332,9 +363,13 @@ class APIClient:
         for result in all_results:
             if isinstance(result, list):
                 merged.extend(result)
-        # If any server had errors, raise exception with details
-        if errors:
+        # Return partial results even if some servers failed
+        # Only raise if ALL servers failed
+        if errors and not merged:
             raise Exception("Ошибки подключения: " + "; ".join(errors))
+        if errors:
+            # Log errors but return what we got
+            logger.warning(f"Partial results from servers, errors: {'; '.join(errors)}")
         return merged
 
     def get_online(self):
@@ -346,8 +381,11 @@ class APIClient:
             if isinstance(result, dict) and 'computers' in result:
                 merged_computers.extend(result['computers'])
                 total_online += result.get('online_count', 0)
-        if errors:
+        # Return partial results even if some servers failed
+        if errors and not merged_computers:
             raise Exception("Ошибки подключения: " + "; ".join(errors))
+        if errors:
+            logger.warning(f"Partial online results from servers, errors: {'; '.join(errors)}")
         return {
             'online_count': total_online,
             'computers': merged_computers,
@@ -459,9 +497,10 @@ class InventoryExplorer:
         ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
         # Server agent status
-        self.server_status_var = tk.StringVar(value="серверный агент оффлайн")
-        self.server_status_label = ttk.Label(toolbar, textvariable=self.server_status_var, font=('Segoe UI', 9, 'bold'), foreground='red')
+        self.server_status_var = tk.StringVar(value="серверный агент: проверка...")
+        self.server_status_label = tk.Label(toolbar, textvariable=self.server_status_var, font=('Segoe UI', 9, 'bold'), fg='red', cursor='hand2')
         self.server_status_label.pack(side=tk.RIGHT, padx=10)
+        self.server_status_label.bind('<Button-1>', self._show_server_status_popup)
 
         self.status_var = tk.StringVar(value="Готов")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side=tk.RIGHT)
@@ -605,12 +644,158 @@ class InventoryExplorer:
 
     def _set_server_online(self, online_data=None):
         server_version = online_data.get('server_version', '?') if online_data else '?'
-        self.server_status_var.set(f"серверный агент онлайн v{server_version}")
-        self.server_status_label.configure(foreground='green')
-
+        self._server_statuses = {'all_online': True, 'servers': []}
+        # Query each server individually for status in background
+        self._refresh_server_statuses_async()
+        
     def _set_server_offline(self):
-        self.server_status_var.set("серверный агент оффлайн")
-        self.server_status_label.configure(foreground='red')
+        self._server_statuses = {'all_online': False, 'servers': []}
+        self._refresh_server_statuses_async()
+        
+    def _refresh_server_statuses_async(self):
+        """Refresh server statuses in background thread"""
+        if getattr(self, '_status_refreshing', False):
+            return
+        self._status_refreshing = True
+        threading.Thread(target=self._do_refresh_server_statuses, daemon=True).start()
+        
+    def _do_refresh_server_statuses(self):
+        """Background task to check each server status"""
+        servers = self.config.get_servers()
+        online_count = 0
+        server_details = []
+        
+        for server in servers:
+            try:
+                result = self.api_client._make_request(server, 'GET', '/api/online')
+                if result:
+                    online_count += 1
+                    server_details.append({
+                        'name': server['name'],
+                        'host': server['host'],
+                        'api_port': server['api_port'],
+                        'status': 'online',
+                        'version': result.get('server_version', '?'),
+                        'online_count': result.get('online_count', 0)
+                    })
+                else:
+                    server_details.append({
+                        'name': server['name'],
+                        'host': server['host'],
+                        'api_port': server['api_port'],
+                        'status': 'offline',
+                        'error': 'Empty response'
+                    })
+            except Exception as e:
+                server_details.append({
+                    'name': server['name'],
+                    'host': server['host'],
+                    'api_port': server['api_port'],
+                    'status': 'error',
+                    'error': str(e)
+                })
+        
+        self._server_statuses = {
+            'all_online': (online_count == len(servers)) if servers else False,
+            'servers': server_details
+        }
+        
+        # Update UI on main thread
+        self.root.after(0, self._apply_server_statuses)
+        self._status_refreshing = False
+        
+    def _apply_server_statuses(self):
+        """Apply server statuses to UI (runs on main thread)"""
+        if not hasattr(self, '_server_statuses'):
+            return
+            
+        servers = self.config.get_servers()
+        online_count = sum(1 for s in self._server_statuses.get('servers', []) if s['status'] == 'online')
+        
+        if self._server_statuses['all_online']:
+            self.server_status_var.set(f"✓ Все серверы онлайн ({len(servers)})")
+            self.server_status_label.configure(fg='green')
+        elif online_count > 0:
+            self.server_status_var.set(f"⚠ Частично онлайн ({online_count}/{len(servers)})")
+            self.server_status_label.configure(fg='orange')
+        else:
+            self.server_status_var.set(f"✗ Серверы недоступны")
+            self.server_status_label.configure(fg='red')
+
+    def _show_server_status_popup(self, event):
+        """Show detailed server status popup"""
+        if not hasattr(self, '_server_statuses'):
+            self._server_statuses = {'servers': []}
+            
+        popup = tk.Toplevel(self.root)
+        popup.title("Статус серверов")
+        popup.geometry("500x400")
+        popup.resizable(False, False)
+        popup.transient(self.root)
+        
+        # Position near the label
+        x = self.server_status_label.winfo_rootx()
+        y = self.server_status_label.winfo_rooty() + self.server_status_label.winfo_height()
+        popup.geometry(f"+{x}+{y}")
+        
+        main_frame = ttk.Frame(popup, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main_frame, text="Статус подключения к серверам:", font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, pady=(0, 10))
+        
+        # Listbox with scrollbar
+        list_frame = ttk.Frame(main_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        listbox = tk.Listbox(list_frame, font=('Consolas', 9), height=12)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        
+        # Add server statuses
+        for server in self._server_statuses.get('servers', []):
+            if server['status'] == 'online':
+                status_icon = "✓"
+                status_text = f"ONLINE  v{server.get('version', '?')}  ({server.get('online_count', 0)} онлайн)"
+            elif server['status'] == 'offline':
+                status_icon = "✗"
+                status_text = f"OFFLINE  {server.get('error', 'No response')}"
+            else:
+                status_icon = "!"
+                status_text = f"ERROR  {server.get('error', 'Unknown')}"
+            
+            display = f"{status_icon}  {server['name']}  ({server['host']}:{server['api_port']})  {status_text}"
+            listbox.insert(tk.END, display)
+        
+        if not self._server_statuses.get('servers'):
+            listbox.insert(tk.END, "Нет настроенных серверов")
+        
+        # Buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(btn_frame, text="Обновить", command=lambda: self._refresh_server_status_popup(listbox, popup)).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Закрыть", command=popup.destroy).pack(side=tk.RIGHT)
+        
+    def _refresh_server_status_popup(self, listbox, popup):
+        """Refresh server statuses in popup"""
+        self._update_server_statuses()
+        listbox.delete(0, tk.END)
+        for server in self._server_statuses.get('servers', []):
+            if server['status'] == 'online':
+                status_icon = "✓"
+                status_text = f"ONLINE  v{server.get('version', '?')}  ({server.get('online_count', 0)} онлайн)"
+            elif server['status'] == 'offline':
+                status_icon = "✗"
+                status_text = f"OFFLINE  {server.get('error', 'No response')}"
+            else:
+                status_icon = "!"
+                status_text = f"ERROR  {server.get('error', 'Unknown')}"
+            
+            display = f"{status_icon}  {server['name']}  ({server['host']}:{server['api_port']})  {status_text}"
+            listbox.insert(tk.END, display)
 
     def _update_tree(self, computers, online_data=None):
         # Save expanded hostnames before rebuilding
@@ -750,12 +935,41 @@ class InventoryExplorer:
         if not comp_id:
             return
         
+        # Check if already loading
+        children = self.tree.get_children(computer_item)
+        for child in children:
+            if 'загрузка' in self.tree.item(child, 'text').lower():
+                return  # Already loading
+        
+        # Add loading placeholder if not exists
+        has_placeholder = False
+        for child in children:
+            if 'загрузка' in self.tree.item(child, 'text').lower():
+                has_placeholder = True
+                break
+        if not has_placeholder:
+            self.tree.insert(computer_item, 'end', text='Загрузка...', values=(''))
+        
+        # Load devices in background
+        threading.Thread(target=self._do_load_devices, args=(computer_item, comp_id), daemon=True).start()
+
+    def _do_load_devices(self, computer_item, comp_id):
+        """Background task to load devices"""
         try:
             devices = self.api_client.get_devices(comp_id)
-            self._populate_devices(computer_item, devices)
+            self.root.after(0, lambda: self._populate_devices(computer_item, devices))
         except Exception as e:
             logger.error(f"Failed to load devices: {e}")
-            self.tree.insert(computer_item, 'end', text=f'Ошибка: {e}', values=(''))
+            self.root.after(0, lambda: self._show_device_error(computer_item, e))
+            
+    def _show_device_error(self, computer_item, error):
+        """Show device load error (runs on main thread)"""
+        children = self.tree.get_children(computer_item)
+        for child in children:
+            if 'загрузка' in self.tree.item(child, 'text').lower():
+                self.tree.delete(child)
+                break
+        self.tree.insert(computer_item, 'end', text=f'Ошибка: {error}', values=(''))
 
     def _populate_devices(self, computer_item, devices):
         # Remove the placeholder
