@@ -5,6 +5,7 @@ STRINGS = {
   "menu.help": "Справка",
   "menu.support": "Поддержать",
   "menu.refresh": "Обновить (F5)",
+  "menu.poll": "Опросить",
   "menu.settings": "Настройки",
   "menu.exit": "Выход",
   "menu.about": "О программе",
@@ -100,5 +101,6 @@ STRINGS = {
   "os.windows_server": "Windows Server",
   "os.unknown": "Неизвестная ОС",
   "version.outdated": "устарел",
-  "version.current": "актуально"
+  "version.current": "актуально",
+  "status.found_pcs": "Найдено ПК: {}"
 }

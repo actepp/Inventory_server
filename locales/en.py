@@ -5,6 +5,7 @@ STRINGS = {
   "menu.help": "Help",
   "menu.support": "Support",
   "menu.refresh": "Refresh (F5)",
+  "menu.poll": "Poll",
   "menu.settings": "Settings",
   "menu.exit": "Exit",
   "menu.about": "About",
@@ -100,5 +101,6 @@ STRINGS = {
   "os.windows_server": "Windows Server",
   "os.unknown": "Unknown OS",
   "version.outdated": "outdated",
-  "version.current": "current"
+  "version.current": "current",
+  "status.found_pcs": "Found PCs: {}"
 }

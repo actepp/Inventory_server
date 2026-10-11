@@ -1,6 +1,5 @@
 import sys
 import json
-import logging
 import threading
 import time
 import concurrent.futures
@@ -18,36 +17,18 @@ from packaging import version
 import tkinter as tk
 from tkinter import ttk, messagebox, font
 
-# Setup logging with file handler for command tracing
-def setup_logger(name, log_file):
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)  # Enable all logging
-    logger.propagate = False
-    
-    # Clear existing handlers
-    logger.handlers.clear()
-    
-    # File handler with rotation
-    from logging.handlers import RotatingFileHandler
-    file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)s | %(message)s')
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
-    
-    # Also add console handler for debugging in non-frozen mode
-    if not getattr(sys, 'frozen', False):
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.DEBUG)
-        console_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)s | %(message)s')
-        console_handler.setFormatter(console_formatter)
-        logger.addHandler(console_handler)
-    
-    return logger
+# No-op logger to disable logging
+class NullLogger:
+    def debug(self, *args, **kwargs): pass
+    def info(self, *args, **kwargs): pass
+    def warning(self, *args, **kwargs): pass
+    def error(self, *args, **kwargs): pass
+    def critical(self, *args, **kwargs): pass
+
+logger = NullLogger()
+cmd_logger = NullLogger()
 
 base_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
-logger = setup_logger('InventoryExplorer', base_dir / "Inventory_explorer.log")
-cmd_logger = setup_logger('InventoryExplorer.Commands', base_dir / "Inventory_explorer.log")
 
 def get_os_display_name(os_name: str, os_version: str) -> str:
     """Get proper OS display name (e.g., Windows 11 vs Windows 10)"""
@@ -663,11 +644,11 @@ class InventoryExplorer:
 
         # Context menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label=self.loc.get("menu.refresh"), command=self._poll_selected)
+        self.context_menu.add_command(label=self.loc.get("menu.poll"), command=self._poll_selected)
         self.context_menu.add_command(label=self.loc.get("toolbar.delete"), command=self._delete_selected)
         self.tree.bind("<Button-3>", self._show_context_menu)
         
-        # Comments column inline editing
+        # Comments column inline editing - single handler that prevents expand on other columns
         self.tree.bind("<Double-1>", self._on_double_click)
         self._comments_edit_widget = None
         self._comments_edit_item = None
@@ -787,6 +768,11 @@ class InventoryExplorer:
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
+            self.tree.focus(item)
+            # Update selected_computer_id for computer items
+            parent = self.tree.parent(item)
+            if not parent:
+                self.selected_computer_id = self._get_computer_uid_from_item(item)
             # Check if this is the client version node
             item_text = self.tree.item(item, 'text').strip()
             if item_text == self.loc.get("tree.client_version"):
@@ -801,14 +787,20 @@ class InventoryExplorer:
         menu.post(event.x_root, event.y_root)
 
     def _on_double_click(self, event):
-        """Handle double-click on tree - start editing comments column"""
+        """Handle double-click on tree - start editing comments column, prevent default expand on other columns"""
         # Identify what was clicked
         region = self.tree.identify_region(event.x, event.y)
         if region != 'cell':
             return
         
         column = self.tree.identify_column(event.x)
-        if column != '#2':  # comments column is #2 (0-based: #0=tree, #1=info, #2=comments)
+        
+        # Prevent default expand/collapse on double-click for tree column (#0) and info column (#1)
+        if column in ('#0', '#1'):
+            return "break"
+        
+        # Only handle comments column (#2)
+        if column != '#2':
             return
         
         item = self.tree.identify_row(event.y)
@@ -1137,7 +1129,7 @@ class InventoryExplorer:
         for item_id in expanded_items:
             self._load_devices(item_id)
         
-        self.status_var.set(f"Найдено ПК: {len(computers)}")
+        self.status_var.set(self.loc.get("status.found_pcs", len(computers)))
         
         # Force load all devices after a short delay
         if computers:
@@ -1405,7 +1397,7 @@ class InventoryExplorer:
             # Check if it's a computer (top level)
             parent = self.tree.parent(item)
             if not parent:
-                self.selected_computer_id = self._get_computer_id_from_item(item)
+                self.selected_computer_id = self._get_computer_uid_from_item(item)
 
     def _add_network_adapter_details(self, parent_item, details_str):
         """Parse network adapter details and create sub-items"""
@@ -1773,7 +1765,7 @@ class InventoryExplorer:
                     self._handle_refresh_error()
                 elif msg_type == 'refresh_done':
                     self._refreshing = False
-                    self.status_var.set(f"Найдено ПК: {len(self.computers_data)}")
+                    self.status_var.set(self.loc.get("status.found_pcs", len(self.computers_data)))
                 elif msg_type == 'push_update':
                     self._handle_push_update()
         except queue.Empty:
