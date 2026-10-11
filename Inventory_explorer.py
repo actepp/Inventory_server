@@ -55,6 +55,51 @@ def get_base_dir():
     return Path(__file__).parent
 
 
+class Localization:
+    def __init__(self, language: str = 'ru'):
+        self.language = language
+        self.strings = {}
+        self.load(language)
+    
+    def load(self, language: str):
+        """Load localization module for given language"""
+        self.language = language
+        try:
+            if language == 'en':
+                from locales.en import STRINGS
+            else:
+                from locales.ru import STRINGS
+                self.language = 'ru'
+            self.strings = STRINGS
+        except Exception as e:
+            logger.error(f"Failed to load locale {language}: {e}")
+            # Fallback to Russian
+            try:
+                from locales.ru import STRINGS
+                self.strings = STRINGS
+                self.language = 'ru'
+            except Exception:
+                self.strings = {}
+    
+    def get(self, key: str, *args) -> str:
+        """Get localized string with optional formatting"""
+        value = self.strings.get(key, key)
+        if args:
+            try:
+                return value.format(*args)
+            except Exception:
+                return value
+        return value
+    
+    def set_language(self, language: str):
+        """Change language and reload strings"""
+        if language != self.language:
+            self.load(language)
+    
+    def get_current_language(self) -> str:
+        return self.language
+
+
 class PushNotificationHandler(BaseHTTPRequestHandler):
     """Handle push notifications from server"""
     def __init__(self, *args, explorer=None, **kwargs):
@@ -163,10 +208,14 @@ class ExplorerConfig:
                     if 'check_interval' not in config:
                         config['check_interval'] = DEFAULT_CHECK_INTERVAL
                         self.save(config)
+                    # Migration: add language if missing
+                    if 'language' not in config:
+                        config['language'] = 'ru'
+                        self.save(config)
                     # Migration: convert old single-server config to new multi-server format
                     if 'servers' not in config and 'server_ip' in config:
                         config['servers'] = [{
-                            'name': 'Основной сервер',
+                            'name': self._t('dialog.settings.servers') if hasattr(self, '_t') else 'Основной сервер',
                             'host': config['server_ip'],
                             'api_port': config.get('api_port', DEFAULT_API_PORT),
                             'server_port': config.get('server_port', DEFAULT_SERVER_PORT)
@@ -187,7 +236,8 @@ class ExplorerConfig:
                 'api_port': DEFAULT_API_PORT,
                 'server_port': DEFAULT_SERVER_PORT
             }],
-            'check_interval': DEFAULT_CHECK_INTERVAL
+            'check_interval': DEFAULT_CHECK_INTERVAL,
+            'language': 'ru'
         }
         self.save(default_config)
         return default_config
@@ -245,6 +295,13 @@ class ExplorerConfig:
 
     def set_check_interval(self, interval: int):
         self.config['check_interval'] = interval
+        self.save()
+    
+    def get_language(self):
+        return self.config.get('language', 'ru')
+    
+    def set_language(self, language: str):
+        self.config['language'] = language
         self.save()
 
     # Backward compatibility
@@ -444,8 +501,10 @@ class InventoryExplorer:
     def __init__(self):
         self.config = ExplorerConfig(CONFIG_FILE)
         self.api_client = APIClient(self.config)
+        # Initialize localization
+        self.loc = Localization(self.config.get_language())
         self.root = tk.Tk()
-        self.root.title("Инвентаризация - Обозреватель")
+        self.root.title(self.loc.get("app.title"))
         self.root.geometry("1000x700")
         self.root.minsize(800, 600)
         
@@ -491,18 +550,18 @@ class InventoryExplorer:
         toolbar = ttk.Frame(main_frame)
         toolbar.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Button(toolbar, text="📡 Опросить все", command=self._poll_all).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(toolbar, text="🗑 Удалить ПК", command=self._delete_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="🔄 Обновить", command=self._refresh_data).pack(side=tk.LEFT, padx=5)
-        ttk.Button(toolbar, text="⚙ Настройки", command=self._show_settings).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text=self.loc.get("toolbar.poll_all"), command=self._poll_all).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(toolbar, text=self.loc.get("toolbar.delete"), command=self._delete_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text=self.loc.get("toolbar.refresh"), command=self._refresh_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text=self.loc.get("toolbar.settings"), command=self._show_settings).pack(side=tk.LEFT, padx=5)
 
         # Server agent status
-        self.server_status_var = tk.StringVar(value="серверный агент: проверка...")
+        self.server_status_var = tk.StringVar(value=self.loc.get("server_status.checking"))
         self.server_status_label = tk.Label(toolbar, textvariable=self.server_status_var, font=('Segoe UI', 9, 'bold'), fg='red', cursor='hand2')
         self.server_status_label.pack(side=tk.RIGHT, padx=10)
         self.server_status_label.bind('<Button-1>', self._show_server_status_popup)
 
-        self.status_var = tk.StringVar(value="Готов")
+        self.status_var = tk.StringVar(value=self.loc.get("status.ready"))
         ttk.Label(toolbar, textvariable=self.status_var).pack(side=tk.RIGHT)
 
         # Tree view
@@ -512,8 +571,8 @@ class InventoryExplorer:
         columns = ('info',)
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='tree headings')
         
-        self.tree.heading('#0', text='Компьютер', anchor=tk.W)
-        self.tree.heading('info', text='Информация', anchor=tk.W)
+        self.tree.heading('#0', text=self.loc.get("tree.computer"), anchor=tk.W)
+        self.tree.heading('info', text=self.loc.get("tree.info"), anchor=tk.W)
 
         self.tree.column('#0', width=300, minwidth=250, stretch=False)
         self.tree.column('info', width=500, minwidth=300, stretch=True)
@@ -539,29 +598,29 @@ class InventoryExplorer:
 
         # Context menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="Опросить", command=self._poll_selected)
-        self.context_menu.add_command(label="Удалить", command=self._delete_selected)
+        self.context_menu.add_command(label=self.loc.get("menu.refresh"), command=self._poll_selected)
+        self.context_menu.add_command(label=self.loc.get("toolbar.delete"), command=self._delete_selected)
         self.tree.bind("<Button-3>", self._show_context_menu)
 
     def _create_menu(self):
         menubar = tk.Menu(self.root)
         
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Обновить (F5)", command=self._refresh_data, accelerator="F5")
+        file_menu.add_command(label=self.loc.get("menu.refresh"), command=self._refresh_data, accelerator="F5")
         file_menu.add_separator()
-        file_menu.add_command(label="Настройки", command=self._show_settings)
+        file_menu.add_command(label=self.loc.get("menu.settings"), command=self._show_settings)
         file_menu.add_separator()
-        file_menu.add_command(label="Выход", command=self._on_close)
-        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label=self.loc.get("menu.exit"), command=self._on_close)
+        menubar.add_cascade(label=self.loc.get("menu.file"), menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="О программе", command=self._show_about)
-        menubar.add_cascade(label="Справка", menu=help_menu)
+        help_menu.add_command(label=self.loc.get("menu.about"), command=self._show_about)
+        menubar.add_cascade(label=self.loc.get("menu.help"), menu=help_menu)
 
         # Support menu
         support_menu = tk.Menu(menubar, tearoff=0)
-        support_menu.add_command(label="💛 DonationAlerts", command=self._show_donation)
-        menubar.add_cascade(label="Поддержать", menu=support_menu)
+        support_menu.add_command(label=self.loc.get("menu.donation"), command=self._show_donation)
+        menubar.add_cascade(label=self.loc.get("menu.support"), menu=support_menu)
 
         self.root.config(menu=menubar)
         self.root.bind('<F5>', lambda e: self._refresh_data())
@@ -569,7 +628,7 @@ class InventoryExplorer:
     def _show_donation(self):
         """Show donation support dialog"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("Поддержать проект")
+        dialog.title(self.loc.get("dialog.donation.title"))
         dialog.geometry("480x380")
         dialog.resizable(False, False)
         dialog.transient(self.root)
@@ -586,34 +645,31 @@ class InventoryExplorer:
         
         # Icon/title
         ttk.Label(main_frame, text="💛", font=('Segoe UI', 48)).pack(pady=(0, 10))
-        ttk.Label(main_frame, text="Поддержать разработку", font=('Segoe UI', 14, 'bold')).pack(pady=(0, 10))
+        ttk.Label(main_frame, text=self.loc.get("dialog.donation.header"), font=('Segoe UI', 14, 'bold')).pack(pady=(0, 10))
         
         # Message
-        msg = ("Если вам нравится этот проект и вы хотите поддержать его развитие,\n"
-               "вы можете сделать пожертвование через DonationAlerts.\n\n"
-               "Каждая поддержка мотивирует делать проект лучше!")
-        ttk.Label(main_frame, text=msg, font=('Segoe UI', 10), justify=tk.CENTER, wraplength=420).pack(pady=(0, 20))
+        ttk.Label(main_frame, text=self.loc.get("dialog.donation.message"), font=('Segoe UI', 10), justify=tk.CENTER, wraplength=420).pack(pady=(0, 20))
         
         # Link frame
         link_frame = ttk.Frame(main_frame)
         link_frame.pack(pady=10, fill=tk.X)
         
         # Clickable link
-        link_label = ttk.Label(link_frame, text="https://www.donationalerts.com/r/actepp", 
+        link_label = ttk.Label(link_frame, text=self.loc.get("dialog.donation.link"), 
                                font=('Segoe UI', 10, 'underline'), foreground='blue', cursor='hand2')
         link_label.pack(pady=(0, 5))
-        link_label.bind('<Button-1>', lambda e: self._open_url("https://www.donationalerts.com/r/actepp"))
+        link_label.bind('<Button-1>', lambda e: self._open_url(self.loc.get("dialog.donation.link")))
         
         # Copy button
         def copy_link():
             self.root.clipboard_clear()
-            self.root.clipboard_append("https://www.donationalerts.com/r/actepp")
-            self.status_var.set("Ссылка скопирована в буфер обмена")
+            self.root.clipboard_append(self.loc.get("dialog.donation.link"))
+            self.status_var.set(self.loc.get("status.copied"))
             
-        ttk.Button(link_frame, text="📋 Копировать ссылку", command=copy_link).pack(pady=5)
+        ttk.Button(link_frame, text=self.loc.get("dialog.donation.copy"), command=copy_link).pack(pady=5)
         
         # Close button
-        ttk.Button(main_frame, text="Закрыть", command=dialog.destroy).pack(pady=(20, 0))
+        ttk.Button(main_frame, text=self.loc.get("dialog.donation.close"), command=dialog.destroy).pack(pady=(20, 0))
         
     def _open_url(self, url):
         """Open URL in default browser"""
@@ -662,7 +718,7 @@ class InventoryExplorer:
             self.tree.selection_set(item)
             # Check if this is the client version node
             item_text = self.tree.item(item, 'text').strip()
-            if item_text == '📦 Версия агент-клиента':
+            if item_text == self.loc.get("tree.client_version"):
                 self._show_client_version_context_menu(event, item)
             else:
                 self.context_menu.post(event.x_root, event.y_root)
@@ -677,7 +733,7 @@ class InventoryExplorer:
         if getattr(self, '_refreshing', False):
             return
         self._refreshing = True
-        self.status_var.set("Загрузка...")
+        self.status_var.set(self.loc.get("status.loading"))
         threading.Thread(target=self._fetch_computers, daemon=True).start()
 
     def _fetch_computers(self):
@@ -772,13 +828,13 @@ class InventoryExplorer:
         online_count = sum(1 for s in self._server_statuses.get('servers', []) if s['status'] == 'online')
         
         if self._server_statuses['all_online']:
-            self.server_status_var.set(f"✓ Все серверы онлайн ({len(servers)})")
+            self.server_status_var.set(self.loc.get("server_status.all_online", len(servers)))
             self.server_status_label.configure(fg='green')
         elif online_count > 0:
-            self.server_status_var.set(f"⚠ Частично онлайн ({online_count}/{len(servers)})")
+            self.server_status_var.set(self.loc.get("server_status.partial", online_count, len(servers)))
             self.server_status_label.configure(fg='orange')
         else:
-            self.server_status_var.set(f"✗ Серверы недоступны")
+            self.server_status_var.set(self.loc.get("server_status.all_offline"))
             self.server_status_label.configure(fg='red')
 
     def _show_server_status_popup(self, event):
@@ -787,7 +843,7 @@ class InventoryExplorer:
             self._server_statuses = {'servers': []}
             
         popup = tk.Toplevel(self.root)
-        popup.title("Статус серверов")
+        popup.title(self.loc.get("dialog.server_status.title"))
         popup.geometry("500x400")
         popup.resizable(False, False)
         popup.transient(self.root)
@@ -800,7 +856,7 @@ class InventoryExplorer:
         main_frame = ttk.Frame(popup, padding=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(main_frame, text="Статус подключения к серверам:", font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, pady=(0, 10))
+        ttk.Label(main_frame, text=self.loc.get("dialog.server_status.header"), font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, pady=(0, 10))
         
         # Listbox with scrollbar
         list_frame = ttk.Frame(main_frame)
@@ -817,26 +873,26 @@ class InventoryExplorer:
         for server in self._server_statuses.get('servers', []):
             if server['status'] == 'online':
                 status_icon = "✓"
-                status_text = f"ONLINE  v{server.get('version', '?')}  ({server.get('online_count', 0)} онлайн)"
+                status_text = self.loc.get("dialog.server_status.online", server.get('version', '?'), server.get('online_count', 0))
             elif server['status'] == 'offline':
                 status_icon = "✗"
-                status_text = f"OFFLINE  {server.get('error', 'No response')}"
+                status_text = self.loc.get("dialog.server_status.offline", server.get('error', 'No response'))
             else:
                 status_icon = "!"
-                status_text = f"ERROR  {server.get('error', 'Unknown')}"
+                status_text = self.loc.get("dialog.server_status.error", server.get('error', 'Unknown'))
             
             display = f"{status_icon}  {server['name']}  ({server['host']}:{server['api_port']})  {status_text}"
             listbox.insert(tk.END, display)
         
         if not self._server_statuses.get('servers'):
-            listbox.insert(tk.END, "Нет настроенных серверов")
+            listbox.insert(tk.END, self.loc.get("dialog.server_status.no_servers"))
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
         
-        ttk.Button(btn_frame, text="Обновить", command=lambda: self._refresh_server_status_popup(listbox, popup)).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="Закрыть", command=popup.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text=self.loc.get("dialog.server_status.refresh"), command=lambda: self._refresh_server_status_popup(listbox, popup)).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text=self.loc.get("dialog.server_status.close"), command=popup.destroy).pack(side=tk.RIGHT)
         
     def _refresh_server_status_popup(self, listbox, popup):
         """Refresh server statuses in popup"""
@@ -845,13 +901,13 @@ class InventoryExplorer:
         for server in self._server_statuses.get('servers', []):
             if server['status'] == 'online':
                 status_icon = "✓"
-                status_text = f"ONLINE  v{server.get('version', '?')}  ({server.get('online_count', 0)} онлайн)"
+                status_text = self.loc.get("dialog.server_status.online", server.get('version', '?'), server.get('online_count', 0))
             elif server['status'] == 'offline':
                 status_icon = "✗"
-                status_text = f"OFFLINE  {server.get('error', 'No response')}"
+                status_text = self.loc.get("dialog.server_status.offline", server.get('error', 'No response'))
             else:
                 status_icon = "!"
-                status_text = f"ERROR  {server.get('error', 'Unknown')}"
+                status_text = self.loc.get("dialog.server_status.error", server.get('error', 'Unknown'))
             
             display = f"{status_icon}  {server['name']}  ({server['host']}:{server['api_port']})  {status_text}"
             listbox.insert(tk.END, display)
@@ -879,7 +935,7 @@ class InventoryExplorer:
             self._add_system_info_nodes(item_id, comp)
             
             # Add placeholder for devices
-            self.tree.insert(item_id, 'end', text='Загрузка...', values=(''))
+            self.tree.insert(item_id, 'end', text=self.loc.get("tree.loading"), values=(''))
             
             # Restore expanded state for this computer
             if comp['hostname'] in expanded_hostnames:
@@ -900,10 +956,10 @@ class InventoryExplorer:
         """Force load devices for all computers"""
         # Find all computer items and load their devices
         for item_id in self.tree.get_children():
-            # Check if it has the "Загрузка..." placeholder
+            # Check if it has the "Loading..." placeholder
             children = self.tree.get_children(item_id)
             for child in children:
-                if self.tree.item(child, 'text') == 'Загрузка...':
+                if self.tree.item(child, 'text') == self.loc.get("tree.loading"):
                     self.tree.delete(child)
                     self._load_devices(item_id)
                     break
@@ -921,11 +977,11 @@ class InventoryExplorer:
         """Add system info as child nodes under computer"""
         # Server name (for multi-server setup)
         server_name = comp.get('_server_name', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🏠 Источник данных', values=(server_name,))
+        self.tree.insert(parent_item, 'end', text=self.loc.get("tree.source"), values=(server_name,))
         
         # Client version
         client_version = comp.get('client_version', '?')
-        version_item = self.tree.insert(parent_item, 'end', text='📦 Версия агент-клиента', values=(client_version,))
+        version_item = self.tree.insert(parent_item, 'end', text=self.loc.get("tree.client_version"), values=(client_version,))
         
         # Apply orange tag if outdated
         if self._latest_client_version and client_version != '?':
@@ -941,22 +997,22 @@ class InventoryExplorer:
         
         # IP Address
         ip = comp.get('ip_address', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🌐 IP адрес', values=(ip,))
+        self.tree.insert(parent_item, 'end', text=self.loc.get("tree.ip"), values=(ip,))
         
         # OS
         os_name = comp.get('os_name', 'Unknown')
         os_version = comp.get('os_version', '')
         os_info = get_os_display_name(os_name, os_version)
-        self.tree.insert(parent_item, 'end', text='🖥 Операционная система', values=(os_info,))
+        self.tree.insert(parent_item, 'end', text=self.loc.get("tree.os"), values=(os_info,))
         
         # CPU
         cpu = comp.get('cpu_info', 'Unknown')
-        self.tree.insert(parent_item, 'end', text='🔧 Процессор', values=(cpu,))
+        self.tree.insert(parent_item, 'end', text=self.loc.get("tree.cpu"), values=(cpu,))
         
         # RAM
         ram = comp.get('ram_total_gb', 0)
-        ram_text = f'{ram:.1f} GB' if ram else 'Unknown'
-        self.tree.insert(parent_item, 'end', text='💾 Оперативная память', values=(ram_text,))
+        ram_text = self.loc.get("tree.gb", ram) if ram else self.loc.get("tree.unknown")
+        self.tree.insert(parent_item, 'end', text=self.loc.get("tree.ram"), values=(ram_text,))
         
         # Last seen
         last_seen = comp.get('last_seen', '')
@@ -966,7 +1022,7 @@ class InventoryExplorer:
                 last_seen = dt.strftime('%d.%m.%Y %H:%M')
             except:
                 pass
-        self.tree.insert(parent_item, 'end', text='🕐 Последний раз', values=(last_seen or 'Unknown',))
+        self.tree.insert(parent_item, 'end', text=self.loc.get("tree.last_seen"), values=(last_seen or self.loc.get("tree.unknown"),))
 
     def _on_tree_open(self, event):
         item = self.tree.focus()
@@ -1153,58 +1209,58 @@ class InventoryExplorer:
 
     def _delete_selected(self):
         if not self.selected_computer_id:
-            messagebox.showwarning("Внимание", "Выберите компьютер для удаления")
+            messagebox.showwarning(self.loc.get("dialog.warning"), self.loc.get("dialog.select_computer_delete"))
             return
         
         comp = self.computers_data.get(self.selected_computer_id)
         if not comp:
             return
         
-        if messagebox.askyesno("Подтверждение", 
-            f"Удалить компьютер '{comp['hostname']}' ({comp['ip_address']})?\nЭто действие необратимо."):
-            self.status_var.set("Удаление...")
+        if messagebox.askyesno(self.loc.get("dialog.confirm_delete_title"), 
+            self.loc.get("dialog.confirm_delete_msg", comp['hostname'], comp['ip_address'])):
+            self.status_var.set(self.loc.get("status.deleting"))
             threading.Thread(target=self._do_delete, args=(self.selected_computer_id,), daemon=True).start()
 
     def _do_delete(self, computer_id):
         try:
             self.api_client.delete_computer(computer_id)
             self.root.after(0, self._refresh_data)
-            self.root.after(0, lambda: self.status_var.set("Удалено"))
+            self.root.after(0, lambda: self.status_var.set(self.loc.get("status.deleted")))
         except Exception as e:
             logger.error(f"Failed to delete computer: {e}")
-            self.root.after(0, lambda: self.status_var.set("Ошибка удаления"))
+            self.root.after(0, lambda: self.status_var.set(self.loc.get("status.delete_error")))
 
     def _poll_selected(self):
         if not self.selected_computer_id:
-            messagebox.showwarning("Внимание", "Выберите компьютер для опроса")
+            messagebox.showwarning(self.loc.get("dialog.warning"), self.loc.get("dialog.select_computer_poll"))
             return
         
-        self.status_var.set("Отправка команды опроса...")
+        self.status_var.set(self.loc.get("status.polling"))
         threading.Thread(target=self._do_poll_and_refresh, args=(self.selected_computer_id,), daemon=True).start()
 
     def _do_poll_and_refresh(self, computer_id):
         try:
             result = self.api_client.poll_computer(computer_id)
-            self.root.after(0, lambda: self.status_var.set(f"Команда опроса отправлена, ждём ответ..."))
+            self.root.after(0, lambda: self.status_var.set(self.loc.get("status.poll_sent_wait")))
             # Wait for client to respond and send inventory
             time.sleep(1.5)
             # Refresh tree to show new data
             self.root.after(0, self._refresh_data)
         except Exception as e:
             logger.error(f"Failed to poll computer: {e}")
-            self.root.after(0, lambda: self.status_var.set("Ошибка опроса"))
+            self.root.after(0, lambda: self.status_var.set(self.loc.get("status.poll_error")))
 
     def _poll_all(self):
-        self.status_var.set("Отправка команды опроса всем...")
+        self.status_var.set(self.loc.get("status.polling_all"))
         threading.Thread(target=self._do_poll_all, daemon=True).start()
 
     def _do_poll_all(self):
         try:
             result = self.api_client.poll_all_computers()
-            self.root.after(0, lambda: self.status_var.set(f"Команда опроса всем отправлена: {result.get('message', 'OK')}"))
+            self.root.after(0, lambda: self.status_var.set(self.loc.get("status.poll_all_sent", result.get('message', 'OK'))))
         except Exception as e:
             logger.error(f"Failed to poll all: {e}")
-            self.root.after(0, lambda: self.status_var.set("Ошибка опроса всех"))
+            self.root.after(0, lambda: self.status_var.set(self.loc.get("status.poll_all_error")))
 
     def _check_client_update(self, version_item):
         """Check for client agent update from GitHub releases"""
@@ -1224,7 +1280,7 @@ class InventoryExplorer:
             return
         
         current_version = self.tree.item(version_item, 'values')[0] if self.tree.item(version_item, 'values') else '?'
-        self.status_var.set("Проверка обновлений...")
+        self.status_var.set(self.loc.get("status.checking_updates"))
         
         threading.Thread(target=self._do_check_client_update, args=(comp_id, current_version, version_item), daemon=True).start()
 
@@ -1368,7 +1424,7 @@ class InventoryExplorer:
         messagebox.showinfo("Проверка обновлений", message)
 
     def _show_settings(self):
-        SettingsWindow(self.root, self.config, self._on_config_change)
+        SettingsWindow(self.root, self.config, self.loc, self._on_config_change)
 
     def _on_config_change(self):
         self.api_client = APIClient(self.config)
@@ -1384,7 +1440,7 @@ class InventoryExplorer:
     def _show_about(self):
         """Show about dialog with clickable link"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("О программе")
+        dialog.title(self.loc.get("dialog.about.title"))
         dialog.geometry("400x280")
         dialog.resizable(False, False)
         dialog.transient(self.root)
@@ -1400,22 +1456,22 @@ class InventoryExplorer:
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         ttk.Label(main_frame, text="🖥", font=('Segoe UI', 48)).pack(pady=(0, 10))
-        ttk.Label(main_frame, text="Инвентаризация — Обозреватель", font=('Segoe UI', 12, 'bold')).pack(pady=(0, 5))
-        ttk.Label(main_frame, text="Версия 1.0", font=('Segoe UI', 10)).pack(pady=(0, 15))
+        ttk.Label(main_frame, text=self.loc.get("app.title"), font=('Segoe UI', 12, 'bold')).pack(pady=(0, 5))
+        ttk.Label(main_frame, text=self.loc.get("dialog.about.version"), font=('Segoe UI', 10)).pack(pady=(0, 15))
         
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
         
-        ttk.Label(main_frame, text="Просмотр и управление инвентаризацией\nкомпьютеров сети", font=('Segoe UI', 9), justify=tk.CENTER).pack(pady=(0, 15))
+        ttk.Label(main_frame, text=self.loc.get("dialog.about.description"), font=('Segoe UI', 9), justify=tk.CENTER).pack(pady=(0, 15))
         
         # Clickable link
-        link_label = ttk.Label(main_frame, text="https://github.com/actep/Inventory_server", 
+        link_label = ttk.Label(main_frame, text=self.loc.get("dialog.about.github"), 
                                font=('Segoe UI', 9, 'underline'), foreground='blue', cursor='hand2')
         link_label.pack(pady=5)
-        link_label.bind('<Button-1>', lambda e: self._open_url("https://github.com/actep/Inventory_server"))
+        link_label.bind('<Button-1>', lambda e: self._open_url(self.loc.get("dialog.about.github")))
         
-        ttk.Label(main_frame, text="Автор: actepp", font=('Segoe UI', 9)).pack(pady=(10, 0))
+        ttk.Label(main_frame, text=self.loc.get("dialog.about.author"), font=('Segoe UI', 9)).pack(pady=(10, 0))
         
-        ttk.Button(main_frame, text="Закрыть", command=dialog.destroy).pack(pady=(20, 0))
+        ttk.Button(main_frame, text=self.loc.get("dialog.about.close"), command=dialog.destroy).pack(pady=(20, 0))
 
     def _on_close(self):
         self._status_check_running = False
@@ -1532,12 +1588,13 @@ class InventoryExplorer:
 
 
 class SettingsWindow:
-    def __init__(self, parent, config: ExplorerConfig, on_save_callback):
+    def __init__(self, parent, config: ExplorerConfig, loc: Localization, on_save_callback):
         self.config = config
+        self.loc = loc
         self.on_save_callback = on_save_callback
         self.window = tk.Toplevel(parent)
-        self.window.title("Настройки Обозревателя")
-        self.window.geometry("550x500")
+        self.window.title(self.loc.get("dialog.settings.title"))
+        self.window.geometry("550x550")
         self.window.resizable(False, False)
         self.window.transient(parent)
         self.window.grab_set()
@@ -1553,7 +1610,7 @@ class SettingsWindow:
         main_frame.rowconfigure(1, weight=1)
 
         # Header
-        ttk.Label(main_frame, text="Настроенные серверы:", font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.servers"), font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
 
         # Server listbox with scrollbar
         list_frame = ttk.Frame(main_frame)
@@ -1573,35 +1630,41 @@ class SettingsWindow:
         btn_frame = ttk.Frame(main_frame)
         btn_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 20))
         
-        ttk.Button(btn_frame, text="➕ Добавить", command=self._add_server).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(btn_frame, text="✏ Изменить", command=self._edit_server).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(btn_frame, text="🗑 Удалить", command=self._remove_server).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text=self.loc.get("dialog.settings.add_server"), command=self._add_server).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text=self.loc.get("dialog.settings.edit_server"), command=self._edit_server).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text=self.loc.get("dialog.settings.remove_server"), command=self._remove_server).pack(side=tk.LEFT)
 
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=3, column=0, sticky=tk.EW, pady=(5, 15))
 
         # Global settings
-        ttk.Label(main_frame, text="Общие настройки:", font=('Segoe UI', 10, 'bold')).grid(row=4, column=0, sticky=tk.W, pady=(0, 10))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.check_interval") + ":", font=('Segoe UI', 10, 'bold')).grid(row=4, column=0, sticky=tk.W, pady=(0, 10))
 
         # Check Interval
-        ttk.Label(main_frame, text="Интервал опроса серверов (сек):").grid(row=5, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.check_interval")).grid(row=5, column=0, sticky=tk.W, pady=(0, 5))
         self.check_interval_var = tk.StringVar(value=str(self.config.get_check_interval()))
         ttk.Entry(main_frame, textvariable=self.check_interval_var).grid(row=6, column=0, sticky=tk.EW, pady=(0, 20))
 
+        # Language selection
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.language")).grid(row=7, column=0, sticky=tk.W, pady=(0, 5))
+        self.language_var = tk.StringVar(value=self.config.get_language())
+        language_combo = ttk.Combobox(main_frame, textvariable=self.language_var, values=['ru', 'en'], state='readonly', width=10)
+        language_combo.grid(row=8, column=0, sticky=tk.W, pady=(0, 20))
+
         # Spacer row
-        main_frame.rowconfigure(7, weight=1)
+        main_frame.rowconfigure(9, weight=1)
 
         # Separator
-        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=8, column=0, sticky=tk.EW, pady=(5, 10))
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=10, column=0, sticky=tk.EW, pady=(5, 10))
 
         # Buttons - bottom right
         btn_frame2 = tk.Frame(main_frame)
-        btn_frame2.grid(row=9, column=0, sticky=tk.E, pady=(0, 10))
+        btn_frame2.grid(row=11, column=0, sticky=tk.E, pady=(0, 10))
 
-        tk.Button(btn_frame2, text="Отмена", command=self.on_cancel, 
+        tk.Button(btn_frame2, text=self.loc.get("dialog.settings.cancel"), command=self.on_cancel, 
                   bg='#e74c3c', fg='white', activebackground='#c0392b', activeforeground='white',
                   relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT, padx=(0, 10))
-        tk.Button(btn_frame2, text="Сохранить", command=self.on_save,
+        tk.Button(btn_frame2, text=self.loc.get("dialog.settings.save"), command=self.on_save,
                   bg='#27ae60', fg='white', activebackground='#219150', activeforeground='white',
                   relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT)
 
@@ -1620,24 +1683,24 @@ class SettingsWindow:
         pass
 
     def _add_server(self):
-        self._server_dialog("Добавить сервер")
+        self._server_dialog(self.loc.get("dialog.add_server.title_add"))
 
     def _edit_server(self):
         selection = self.server_listbox.curselection()
         if not selection:
-            messagebox.showwarning("Внимание", "Выберите сервер для редактирования")
+            messagebox.showwarning(self.loc.get("dialog.warning"), self.loc.get("dialog.settings.add_server") + " / " + self.loc.get("dialog.settings.edit_server"))
             return
         index = selection[0]
-        self._server_dialog("Изменить сервер", index)
+        self._server_dialog(self.loc.get("dialog.add_server.title_edit"), index)
 
     def _remove_server(self):
         selection = self.server_listbox.curselection()
         if not selection:
-            messagebox.showwarning("Внимание", "Выберите сервер для удаления")
+            messagebox.showwarning(self.loc.get("dialog.warning"), self.loc.get("dialog.settings.remove_server"))
             return
         index = selection[0]
         server = self.config.get_servers()[index]
-        if messagebox.askyesno("Подтверждение", f"Удалить сервер '{server['name']}'?"):
+        if messagebox.askyesno(self.loc.get("dialog.confirm_delete_title"), f"Удалить сервер '{server['name']}'?"):
             self.config.remove_server(index)
             self._refresh_server_list()
 
@@ -1664,22 +1727,22 @@ class SettingsWindow:
         main_frame.columnconfigure(1, weight=1)
 
         # Name
-        ttk.Label(main_frame, text="Имя сервера (для отображения):").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.server_name")).grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
         name_var = tk.StringVar(value=name_val)
         ttk.Entry(main_frame, textvariable=name_var).grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
         # Host (IP or hostname)
-        ttk.Label(main_frame, text="Адрес сервера (IP или имя):").grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.server_host")).grid(row=2, column=0, sticky=tk.W, pady=(0, 5))
         host_var = tk.StringVar(value=host_val)
         ttk.Entry(main_frame, textvariable=host_var).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
         # API Port
-        ttk.Label(main_frame, text="Порт API (веб):").grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.server_api_port")).grid(row=4, column=0, sticky=tk.W, pady=(0, 5))
         api_port_var = tk.StringVar(value=api_port_val)
         ttk.Entry(main_frame, textvariable=api_port_var).grid(row=5, column=0, columnspan=2, sticky=tk.EW, pady=(0, 10))
 
         # Server Port (agents)
-        ttk.Label(main_frame, text="Порт сервера (агенты):").grid(row=6, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(main_frame, text=self.loc.get("dialog.settings.server_tcp_port")).grid(row=6, column=0, sticky=tk.W, pady=(0, 5))
         server_port_var = tk.StringVar(value=server_port_val)
         ttk.Entry(main_frame, textvariable=server_port_var).grid(row=7, column=0, columnspan=2, sticky=tk.EW, pady=(0, 20))
 
@@ -1715,12 +1778,12 @@ class SettingsWindow:
                 self._refresh_server_list()
                 dialog.destroy()
             except ValueError as e:
-                messagebox.showerror("Ошибка", str(e))
+                messagebox.showerror(self.loc.get("dialog.warning"), str(e))
 
-        tk.Button(btn_frame, text="Отмена", command=dialog.destroy, 
+        tk.Button(btn_frame, text=self.loc.get("dialog.settings.cancel"), command=dialog.destroy, 
                   bg='#e74c3c', fg='white', activebackground='#c0392b', activeforeground='white',
                   relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT, padx=(0, 10))
-        tk.Button(btn_frame, text="Сохранить", command=on_save,
+        tk.Button(btn_frame, text=self.loc.get("dialog.settings.save"), command=on_save,
                   bg='#27ae60', fg='white', activebackground='#219150', activeforeground='white',
                   relief=tk.FLAT, padx=20, pady=8, font=('Segoe UI', 9), cursor='hand2').pack(side=tk.LEFT)
 
@@ -1742,14 +1805,24 @@ class SettingsWindow:
         try:
             check_interval = int(self.check_interval_var.get())
             if check_interval < 5:
-                raise ValueError("Интервал опроса не может быть меньше 5 секунд")
+                raise ValueError(self.loc.get("dialog.warning"))
             
             self.config.set_check_interval(check_interval)
+            
+            # Save language if changed
+            new_language = self.language_var.get()
+            if new_language != self.config.get_language():
+                self.config.set_language(new_language)
+                # Reload localization
+                self.loc.set_language(new_language)
+                # Notify main window to refresh UI (requires restart or manual refresh)
+                messagebox.showinfo(self.loc.get("menu.about"), 
+                    "Language changed. Please restart the application for full effect.")
             
             self.on_save_callback()
             self.window.destroy()
         except ValueError as e:
-            messagebox.showerror("Ошибка", str(e))
+            messagebox.showerror(self.loc.get("dialog.warning"), str(e))
 
     def on_cancel(self):
         self.window.destroy()
