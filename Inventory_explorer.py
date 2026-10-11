@@ -18,17 +18,30 @@ from packaging import version
 import tkinter as tk
 from tkinter import ttk, messagebox, font
 
-# Setup logging with file handler for command tracing - DISABLED
+# Setup logging with file handler for command tracing
 def setup_logger(name, log_file):
     logger = logging.getLogger(name)
-    logger.setLevel(logging.CRITICAL)  # Disable all logging
+    logger.setLevel(logging.DEBUG)  # Enable all logging
     logger.propagate = False
     
     # Clear existing handlers
     logger.handlers.clear()
     
-    # Add null handler to prevent "No handlers found" warnings
-    logger.addHandler(logging.NullHandler())
+    # File handler with rotation
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)s | %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Also add console handler for debugging in non-frozen mode
+    if not getattr(sys, 'frozen', False):
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)
+        console_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)s | %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
     
     return logger
 
@@ -731,24 +744,31 @@ class InventoryExplorer:
 
     def _refresh_data(self):
         if getattr(self, '_refreshing', False):
+            logger.info("_refresh_data: already refreshing, skipping")
             return
+        logger.info("_refresh_data: starting refresh")
         self._refreshing = True
         self.status_var.set(self.loc.get("status.loading"))
         threading.Thread(target=self._fetch_computers, daemon=True).start()
 
     def _fetch_computers(self):
+        logger.info("_fetch_computers: requesting computers from API")
         try:
             computers = self.api_client.get_computers()
+            logger.info(f"_fetch_computers: received {len(computers)} computers")
+            for comp in computers:
+                logger.debug(f"  Computer: hostname={comp.get('hostname')}, id={comp.get('id')}")
             online_data = self.api_client.get_online()
             self._msg_queue.put(('refresh_data', (computers, online_data)))
         except Exception as e:
-            logger.error(f"Failed to fetch computers: {e}")
+            logger.error(f"_fetch_computers: failed: {e}")
             self._msg_queue.put(('refresh_error', None))
         finally:
             self._msg_queue.put(('refresh_done', None))
 
     def _handle_refresh_data(self, data):
         computers, online_data = data
+        logger.info(f"_handle_refresh_data: updating tree with {len(computers)} computers")
         self._update_tree(computers)
         self._set_server_online(online_data)
 
@@ -913,8 +933,10 @@ class InventoryExplorer:
             listbox.insert(tk.END, display)
 
     def _update_tree(self, computers, online_data=None):
+        logger.info(f"_update_tree: called with {len(computers)} computers")
         # Save expanded hostnames before rebuilding
         expanded_hostnames = self._get_expanded_hostnames()
+        logger.debug(f"_update_tree: expanded_hostnames={expanded_hostnames}")
         
         self.tree.delete(*self.tree.get_children())
         self.computers_data = {}
@@ -954,15 +976,22 @@ class InventoryExplorer:
 
     def _force_load_all_devices(self):
         """Force load devices for all computers"""
+        logger.info("_force_load_all_devices: checking for computers with loading placeholder")
+        loaded_count = 0
         # Find all computer items and load their devices
         for item_id in self.tree.get_children():
             # Check if it has the "Loading..." placeholder
             children = self.tree.get_children(item_id)
             for child in children:
                 if self.tree.item(child, 'text') == self.loc.get("tree.loading"):
+                    hostname = self.tree.item(item_id, 'text').strip()
+                    logger.info(f"_force_load_all_devices: loading devices for {hostname}")
                     self.tree.delete(child)
                     self._load_devices(item_id)
+                    loaded_count += 1
                     break
+        if loaded_count > 0:
+            logger.info(f"_force_load_all_devices: triggered load for {loaded_count} computers")
 
     def _get_expanded_hostnames(self):
         """Get hostnames of expanded computer nodes"""
@@ -1048,49 +1077,66 @@ class InventoryExplorer:
                 break
         
         if not comp_id:
+            logger.warning(f"_load_devices: comp_id not found for {computer_text}")
             return
         
-        # Check if already loading
+        loading_text = self.loc.get("tree.loading")
+        
+        # Check if already loading (has placeholder)
         children = self.tree.get_children(computer_item)
         for child in children:
-            if 'загрузка' in self.tree.item(child, 'text').lower():
+            if loading_text.lower() in self.tree.item(child, 'text').lower():
+                logger.info(f"_load_devices: already loading for {computer_text} (comp_id={comp_id}), skipping")
                 return  # Already loading
         
-        # Add loading placeholder if not exists
-        has_placeholder = False
+        # Remove any existing device nodes (will be replaced with fresh data)
+        device_icons = ('🔧', '💾', '🎮', '🖥', '📋', '💿', '🌐')
+        cleared_count = 0
         for child in children:
-            if 'загрузка' in self.tree.item(child, 'text').lower():
-                has_placeholder = True
-                break
-        if not has_placeholder:
-            self.tree.insert(computer_item, 'end', text='Загрузка...', values=(''))
+            if self.tree.item(child, 'text').startswith(device_icons):
+                self.tree.delete(child)
+                cleared_count += 1
+        
+        if cleared_count > 0:
+            logger.info(f"_load_devices: cleared {cleared_count} existing device nodes for {computer_text} (comp_id={comp_id})")
+        
+        # Add loading placeholder
+        self.tree.insert(computer_item, 'end', text=loading_text, values=(''))
+        logger.info(f"_load_devices: started loading for {computer_text} (comp_id={comp_id})")
         
         # Load devices in background
         threading.Thread(target=self._do_load_devices, args=(computer_item, comp_id), daemon=True).start()
 
     def _do_load_devices(self, computer_item, comp_id):
         """Background task to load devices"""
+        logger.info(f"_do_load_devices: requesting devices for comp_id={comp_id}")
         try:
             devices = self.api_client.get_devices(comp_id)
+            logger.info(f"_do_load_devices: received {len(devices)} devices for comp_id={comp_id}")
+            for dev in devices:
+                logger.debug(f"  Device: class={dev.get('device_class')}, name={dev.get('device_name')}")
             self.root.after(0, lambda: self._populate_devices(computer_item, devices))
         except Exception as e:
-            logger.error(f"Failed to load devices: {e}")
+            logger.error(f"_do_load_devices: failed for comp_id={comp_id}: {e}")
             self.root.after(0, lambda: self._show_device_error(computer_item, e))
             
     def _show_device_error(self, computer_item, error):
         """Show device load error (runs on main thread)"""
+        loading_text = self.loc.get("tree.loading")
         children = self.tree.get_children(computer_item)
         for child in children:
-            if 'загрузка' in self.tree.item(child, 'text').lower():
+            if loading_text.lower() in self.tree.item(child, 'text').lower():
                 self.tree.delete(child)
                 break
         self.tree.insert(computer_item, 'end', text=f'Ошибка: {error}', values=(''))
 
     def _populate_devices(self, computer_item, devices):
+        logger.info(f"_populate_devices: called with {len(devices)} devices for computer_item={computer_item}")
         # Remove the placeholder
+        loading_text = self.loc.get("tree.loading")
         children = self.tree.get_children(computer_item)
         for child in children:
-            if 'загрузка' in self.tree.item(child, 'text').lower():
+            if loading_text.lower() in self.tree.item(child, 'text').lower():
                 self.tree.delete(child)
                 break
         
@@ -1101,6 +1147,10 @@ class InventoryExplorer:
             if cls not in classes:
                 classes[cls] = []
             classes[cls].append(dev)
+        
+        logger.info(f"_populate_devices: grouped into classes: {list(classes.keys())}")
+        for cls, devs in classes.items():
+            logger.info(f"  {cls}: {len(devs)} devices")
         
         # Class icons and Russian names mapping
         class_icons = {
