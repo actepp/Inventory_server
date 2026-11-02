@@ -58,23 +58,35 @@ DEFAULT_PORT = 5001
 DEFAULT_API_PORT = 5002
 SERVER_VERSION = "1.0.0"
 
-# Setup logging with file handler for command tracing - DISABLED
+# Setup logging - only critical events (startup, errors, crashes)
 def setup_logger(name, log_file):
     logger = logging.getLogger(name)
-    logger.setLevel(logging.CRITICAL)  # Disable all logging
+    logger.setLevel(logging.INFO)  # Capture INFO and above
     logger.propagate = False
     
     # Clear existing handlers
     logger.handlers.clear()
     
-    # Add null handler to prevent "No handlers found" warnings
-    logger.addHandler(logging.NullHandler())
+    # File handler with rotation (5 MB, 3 backups)
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(name)s | %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
     
     return logger
 
 base_dir = get_base_dir()
 logger = setup_logger('InventoryServer', base_dir / "Inventory_server.log")
 cmd_logger = setup_logger('InventoryServer.Commands', base_dir / "Inventory_server.log")
+
+logger.info("=" * 60)
+logger.info(f"Inventory Server v{SERVER_VERSION} starting up")
+logger.info(f"Base directory: {base_dir}")
+logger.info(f"Config file: {CONFIG_FILE}")
+logger.info(f"Database file: {DB_FILE}")
+logger.info("=" * 60)
 
 
 class DatabaseManager:
@@ -584,7 +596,11 @@ class APIServer:
         logger.info("API server stopped")
 
     def _run(self):
-        self.server.serve_forever()
+        try:
+            self.server.serve_forever()
+        except Exception as e:
+            if self.running:  # Only log if not intentionally stopped
+                logger.error(f"API server error: {e}")
 
 
 class ConfigManager:
@@ -900,6 +916,7 @@ class InventoryServer:
         self.root.after(0, lambda: SettingsWindow(self.root, self.config_manager, on_port_change, on_api_port_change))
 
     def _exit_app(self, icon=None, item=None):
+        logger.info("Shutdown requested via tray menu")
         self.listener.stop()
         self.api_server.stop()
         if self.tray_icon:
@@ -908,5 +925,16 @@ class InventoryServer:
 
 
 if __name__ == "__main__":
-    server = InventoryServer()
-    server.run()
+    try:
+        server = InventoryServer()
+        logger.info("Server initialized, starting main loop")
+        server.run()
+        logger.info("Server main loop exited normally")
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user (Ctrl+C)")
+    except SystemExit as e:
+        logger.info(f"Server exited with SystemExit: {e}")
+    except Exception as e:
+        logger.exception(f"Server crashed with unhandled exception: {e}")
+        # Re-raise so the crash is visible
+        raise
